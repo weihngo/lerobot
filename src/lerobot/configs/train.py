@@ -68,6 +68,7 @@ class TrainPipelineConfig(HubMixin):
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
+    tensorboard_dir: Path | None = None
     peft: PeftConfig | None = None
 
     # RA-BC (Reward-Aligned Behavior Cloning) parameters
@@ -128,6 +129,9 @@ class TrainPipelineConfig(HubMixin):
             now = dt.datetime.now()
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
             self.output_dir = Path("outputs/train") / train_dir
+
+        if self.tensorboard_dir is None:
+            self.tensorboard_dir = self.output_dir / "tensorboard"
 
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")

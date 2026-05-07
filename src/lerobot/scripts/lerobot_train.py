@@ -18,12 +18,14 @@ import logging
 import time
 from contextlib import nullcontext
 from pprint import pformat
+from numbers import Real
 from typing import Any
 
 import torch
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from lerobot.configs import parser
@@ -186,7 +188,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             cpu=force_cpu,
         )
 
-    init_logging(accelerator=accelerator)
+    init_logging(log_file=cfg.output_dir / "train.log", accelerator=accelerator)
 
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
@@ -337,8 +339,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
+    writer = SummaryWriter(log_dir=str(cfg.tensorboard_dir)) if is_main_process else None
+
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+        logging.info(colored("TensorBoard dir:", "yellow", attrs=["bold"]) + f" {cfg.tensorboard_dir}")
         if cfg.env is not None:
             logging.info(f"{cfg.env.task=}")
             logging.info("Creating environment processors")
@@ -442,6 +447,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         step += 1
         if is_main_process:
             progbar.update(1)
+            progbar.set_postfix(loss=f"{train_tracker.loss.val:.3f}")
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
@@ -449,6 +455,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if is_log_step:
             logging.info(train_tracker)
+            if writer is not None:
+                for name, value in train_tracker.to_dict().items():
+                    writer.add_scalar(f"train/{name}", value, step)
+                if output_dict:
+                    for name, value in output_dict.items():
+                        if isinstance(value, Real):
+                            writer.add_scalar(f"train/{name}", value, step)
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
@@ -528,6 +541,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
+                if writer is not None:
+                    for name, value in eval_tracker.to_dict().items():
+                        writer.add_scalar(f"eval/{name}", value, step)
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
@@ -542,6 +558,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         close_envs(eval_env)
 
     if is_main_process:
+        if writer is not None:
+            writer.close()
         logging.info("End of training")
 
         if cfg.policy.push_to_hub:

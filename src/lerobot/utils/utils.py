@@ -90,6 +90,8 @@ def init_logging(
         logger.setLevel(logging.ERROR)
 
     if log_file is not None:
+        log_file = Path(log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(formatter)
         file_handler.setLevel(file_level.upper())
