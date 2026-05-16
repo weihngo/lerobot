@@ -38,6 +38,33 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
+def _split_lekiwi_banana_targets(
+    action: Tensor,
+    *,
+    arm_action_dim: int,
+    base_direction_index: int,
+) -> tuple[Tensor, Tensor]:
+    arm_target = action[..., :arm_action_dim]
+    base_move_target = (action[..., base_direction_index] > 0).to(action.dtype).unsqueeze(-1)
+    return arm_target, base_move_target
+
+
+def _assemble_lekiwi_banana_action(
+    arm_action: Tensor,
+    base_move_prob: Tensor,
+    *,
+    threshold: float,
+    forward_speed: float,
+    stop_value: float = 0.0,
+    move_value: float | None = None,
+) -> Tensor:
+    move_mask = (base_move_prob > threshold).to(arm_action.dtype)
+    base_value = move_value if move_value is not None else forward_speed
+    theta = torch.where(move_mask.bool(), torch.full_like(base_move_prob, base_value), torch.full_like(base_move_prob, stop_value))
+    zeros = torch.zeros_like(theta)
+    return torch.cat([arm_action, zeros, zeros, theta], dim=-1)
+
+
 class ACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -50,6 +77,7 @@ class ACTPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: ACTConfig,
+        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
         **kwargs,
     ):
         """
@@ -60,8 +88,20 @@ class ACTPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self.dataset_stats = dataset_stats
 
         self.model = ACT(config)
+        self._binary_base_stop_value = 0.0
+        self._binary_base_move_value = config.base_forward_speed
+        if dataset_stats is not None and ACTION in dataset_stats:
+            action_stats = dataset_stats[ACTION]
+            mean = torch.as_tensor(action_stats["mean"], dtype=torch.float32)
+            std = torch.as_tensor(action_stats["std"], dtype=torch.float32)
+            if mean.numel() > config.base_direction_index and std.numel() > config.base_direction_index:
+                theta_mean = mean[config.base_direction_index]
+                theta_std = std[config.base_direction_index] + 1e-8
+                self._binary_base_stop_value = ((0.0 - theta_mean) / theta_std).item()
+                self._binary_base_move_value = ((config.base_forward_speed - theta_mean) / theta_std).item()
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -130,7 +170,19 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions = self.model(batch)[0]
+        model_output, _ = self.model(batch)
+        if self.config.use_split_heads and self.config.base_mode == "binary_move":
+            arm_actions, base_move_logits = model_output
+            actions = _assemble_lekiwi_banana_action(
+                arm_actions,
+                torch.sigmoid(base_move_logits),
+                threshold=self.config.base_move_threshold,
+                forward_speed=self.config.base_forward_speed,
+                stop_value=self._binary_base_stop_value,
+                move_value=self._binary_base_move_value,
+            )
+        else:
+            actions = model_output
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -139,13 +191,38 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        model_output, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        l1_loss = (
-            F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
-
-        loss_dict = {"l1_loss": l1_loss.item()}
+        if self.config.use_split_heads and self.config.base_mode == "binary_move":
+            arm_actions_hat, base_move_logits = model_output
+            valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
+            arm_target = batch[ACTION][..., : self.config.arm_action_dim]
+            arm_l1_loss = (F.l1_loss(arm_target, arm_actions_hat, reduction="none") * valid_mask).mean()
+            pos_weight = base_move_logits.new_tensor([self.config.base_pos_weight])
+            base_move_target = batch["base_move_target"].to(dtype=base_move_logits.dtype)
+            base_bce_loss = (
+                F.binary_cross_entropy_with_logits(
+                    base_move_logits,
+                    base_move_target,
+                    reduction="none",
+                    pos_weight=pos_weight,
+                )
+                * valid_mask
+            ).mean()
+            loss = arm_l1_loss + self.config.base_move_loss_weight * base_bce_loss
+            loss_dict = {
+                "arm_l1_loss": arm_l1_loss.item(),
+                "base_bce_loss": base_bce_loss.item(),
+            }
+            reconstruction_loss = arm_l1_loss + self.config.base_move_loss_weight * base_bce_loss
+        else:
+            actions_hat = model_output
+            l1_loss = (
+                F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
+            ).mean()
+            loss = l1_loss
+            loss_dict = {"l1_loss": l1_loss.item()}
+            reconstruction_loss = l1_loss
         if self.config.use_vae:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total
@@ -155,9 +232,7 @@ class ACTPolicy(PreTrainedPolicy):
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
-            loss = l1_loss + mean_kld * self.config.kl_weight
-        else:
-            loss = l1_loss
+            loss = reconstruction_loss + mean_kld * self.config.kl_weight
 
         return loss, loss_dict
 
@@ -364,8 +439,12 @@ class ACT(nn.Module):
         # Learnable positional embedding for the transformer's decoder (in the style of DETR object queries).
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
 
-        # Final action regression head on the output of the transformer's decoder.
-        self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+        # Final action head(s) on the output of the transformer's decoder.
+        if self.config.use_split_heads and self.config.base_mode == "binary_move":
+            self.arm_action_head = nn.Linear(config.dim_model, self.config.arm_action_dim)
+            self.base_move_head = nn.Linear(config.dim_model, 1)
+        else:
+            self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
 
         self._reset_parameters()
 
@@ -505,8 +584,10 @@ class ACT(nn.Module):
         # Move back to (B, S, C).
         decoder_out = decoder_out.transpose(0, 1)
 
-        actions = self.action_head(decoder_out)
+        if self.config.use_split_heads and self.config.base_mode == "binary_move":
+            return (self.arm_action_head(decoder_out), self.base_move_head(decoder_out)), (mu, log_sigma_x2)
 
+        actions = self.action_head(decoder_out)
         return actions, (mu, log_sigma_x2)
 
 

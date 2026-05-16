@@ -122,6 +122,15 @@ class ACTConfig(PreTrainedConfig):
     # Training and loss computation.
     dropout: float = 0.1
     kl_weight: float = 10.0
+    use_split_heads: bool = False
+    arm_action_dim: int = 6
+    base_mode: str = "continuous"
+    base_direction_index: int = 8
+    base_unused_indices: list[int] = field(default_factory=lambda: [6, 7])
+    base_forward_speed: float = 30.0
+    base_move_loss_weight: float = 1.0
+    base_pos_weight: float = 19.3
+    base_move_threshold: float = 0.5
 
     # Training preset
     optimizer_lr: float = 1e-5
@@ -150,6 +159,17 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.use_split_heads:
+            if self.arm_action_dim <= 0:
+                raise ValueError(f"`arm_action_dim` must be positive. Got {self.arm_action_dim}.")
+            if self.base_mode not in {"continuous", "binary_move"}:
+                raise ValueError(f"Unsupported `base_mode`: {self.base_mode}.")
+            if self.base_direction_index in self.base_unused_indices:
+                raise ValueError(
+                    "`base_direction_index` must not overlap with `base_unused_indices` when using split heads."
+                )
+            if self.base_pos_weight <= 0:
+                raise ValueError(f"`base_pos_weight` must be positive. Got {self.base_pos_weight}.")
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

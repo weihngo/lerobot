@@ -13,10 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -24,11 +26,39 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStep,
     RenameObservationsProcessorStep,
+    TransitionKey,
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+
+@dataclass
+class ExtractLeKiwiBananaTargetsProcessorStep(ProcessorStep):
+    arm_action_dim: int = 6
+    base_direction_index: int = 8
+
+    def __call__(self, transition):
+        new_transition = transition.copy()
+        action = new_transition.get(TransitionKey.ACTION)
+        if action is None:
+            raise ValueError("ExtractLeKiwiBananaTargetsProcessorStep requires an action in the transition.")
+
+        action_tensor = torch.as_tensor(action)
+        base_move_target = (action_tensor[..., self.base_direction_index] > 0).to(torch.float32).unsqueeze(-1)
+
+        complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+        complementary_data["base_move_target"] = base_move_target
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        new_transition["base_move_target"] = base_move_target
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
 
 
 def make_act_pre_post_processors(
@@ -56,14 +86,25 @@ def make_act_pre_post_processors(
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
-        DeviceProcessorStep(device=config.device),
-        NormalizerProcessorStep(
-            features={**config.input_features, **config.output_features},
-            norm_map=config.normalization_mapping,
-            stats=dataset_stats,
-            device=config.device,
-        ),
     ]
+    if config.use_split_heads and config.base_mode == "binary_move":
+        input_steps.append(
+            ExtractLeKiwiBananaTargetsProcessorStep(
+                arm_action_dim=config.arm_action_dim,
+                base_direction_index=config.base_direction_index,
+            )
+        )
+    input_steps.extend(
+        [
+            DeviceProcessorStep(device=config.device),
+            NormalizerProcessorStep(
+                features={**config.input_features, **config.output_features},
+                norm_map=config.normalization_mapping,
+                stats=dataset_stats,
+                device=config.device,
+            ),
+        ]
+    )
     output_steps = [
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats

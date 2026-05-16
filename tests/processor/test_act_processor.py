@@ -22,7 +22,10 @@ import torch
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.processor_act import make_act_pre_post_processors
+from lerobot.policies.act.processor_act import (
+    ExtractLeKiwiBananaTargetsProcessorStep,
+    make_act_pre_post_processors,
+)
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
@@ -51,6 +54,39 @@ def create_default_config():
     }
     config.device = "cpu"
     return config
+
+
+def create_lekiwi_banana_config():
+    config = ACTConfig(
+        use_split_heads=True,
+        arm_action_dim=6,
+        base_mode="binary_move",
+        base_direction_index=8,
+        base_unused_indices=[6, 7],
+        base_forward_speed=30.0,
+    )
+    config.input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(9,)),
+    }
+    config.output_features = {
+        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(9,)),
+    }
+    config.normalization_mapping = {
+        FeatureType.STATE: NormalizationMode.MEAN_STD,
+        FeatureType.ACTION: NormalizationMode.MEAN_STD,
+    }
+    config.device = "cpu"
+    return config
+
+
+def create_lekiwi_banana_stats():
+    return {
+        OBS_STATE: {"mean": torch.zeros(9), "std": torch.ones(9)},
+        ACTION: {
+            "mean": torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.4773419]),
+            "std": torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1e-8, 1e-8, 6.4913573]),
+        },
+    }
 
 
 def create_default_stats():
@@ -83,6 +119,31 @@ def test_make_act_processor_basic():
     assert len(postprocessor.steps) == 2
     assert isinstance(postprocessor.steps[0], UnnormalizerProcessorStep)
     assert isinstance(postprocessor.steps[1], DeviceProcessorStep)
+
+
+def test_extract_lekiwi_banana_targets_step():
+    step = ExtractLeKiwiBananaTargetsProcessorStep(arm_action_dim=6, base_direction_index=8)
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(9)},
+        TransitionKey.ACTION: torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 30.0]),
+        TransitionKey.COMPLEMENTARY_DATA: {},
+    }
+
+    processed = step(transition)
+
+    assert torch.equal(processed["base_move_target"], torch.tensor([1.0]))
+    assert torch.equal(processed[TransitionKey.COMPLEMENTARY_DATA]["base_move_target"], torch.tensor([1.0]))
+
+
+def test_make_act_processor_includes_lekiwi_target_extractor():
+    config = create_lekiwi_banana_config()
+    stats = create_lekiwi_banana_stats()
+
+    preprocessor, _ = make_act_pre_post_processors(config, stats)
+
+    assert isinstance(preprocessor.steps[2], ExtractLeKiwiBananaTargetsProcessorStep)
+    assert isinstance(preprocessor.steps[3], DeviceProcessorStep)
+    assert isinstance(preprocessor.steps[4], NormalizerProcessorStep)
 
 
 def test_act_processor_normalization():
