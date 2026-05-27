@@ -13,8 +13,10 @@
 # limitations under the License.
 import importlib
 import inspect
+import json
 import pkgutil
 import sys
+import tempfile
 from argparse import ArgumentError
 from collections.abc import Callable, Iterable, Sequence
 from functools import wraps
@@ -190,6 +192,107 @@ def filter_path_args(fields_to_filter: str | list[str], args: Sequence[str] | No
             filtered_args = [arg for arg in filtered_args if not arg.startswith(f"--{field}.")]
 
     return filtered_args
+
+
+def strip_json_comments(text: str) -> str:
+    """Remove JSONC-style // and /* */ comments while preserving string contents."""
+
+    result: list[str] = []
+    in_string = False
+    in_line_comment = False
+    in_block_comment = False
+    escape = False
+    i = 0
+
+    while i < len(text):
+        char = text[i]
+        next_char = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_line_comment:
+            if char == "\n":
+                in_line_comment = False
+                result.append(char)
+            i += 1
+            continue
+
+        if in_block_comment:
+            if char == "*" and next_char == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                if char == "\n":
+                    result.append(char)
+                i += 1
+            continue
+
+        if in_string:
+            result.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+            i += 1
+            continue
+
+        if char == "/" and next_char == "/":
+            in_line_comment = True
+            i += 2
+            continue
+
+        if char == "/" and next_char == "*":
+            in_block_comment = True
+            i += 2
+            continue
+
+        result.append(char)
+        i += 1
+
+    return "".join(result)
+
+
+def strip_comment_fields(value: Any) -> Any:
+    """Remove `_comment` fields recursively from decoded config objects."""
+
+    if isinstance(value, dict):
+        return {
+            key: strip_comment_fields(child)
+            for key, child in value.items()
+            if key != "_comment" and not key.startswith("_comment_")
+        }
+    if isinstance(value, list):
+        return [strip_comment_fields(item) for item in value]
+    return value
+
+
+def prepare_json_config_for_draccus(config_file: str | Path) -> str:
+    """Convert a local JSON/JSONC config file into a strict JSON file path for draccus."""
+
+    config_path = Path(config_file)
+    if not config_path.is_file():
+        return str(config_file)
+
+    raw_text = config_path.read_text()
+    if (
+        config_path.suffix != ".jsonc"
+        and "//" not in raw_text
+        and "/*" not in raw_text
+        and '"_comment"' not in raw_text
+        and '"_comment_' not in raw_text
+    ):
+        return str(config_path)
+
+    parsed = strip_comment_fields(json.loads(strip_json_comments(raw_text)))
+    with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as handle:
+        json.dump(parsed, handle)
+        return handle.name
 
 
 def wrap(config_path: Path | None = None) -> Callable[[F], F]:

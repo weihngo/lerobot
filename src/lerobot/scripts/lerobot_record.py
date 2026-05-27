@@ -362,6 +362,8 @@ def record_loop(
             break
 
         # Get robot observation
+        if len(policy._action_queue) == 0:
+            time.sleep(0)
         obs = robot.get_observation()
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
@@ -452,6 +454,8 @@ def record_loop(
                 )
             continue
 
+        print(f"action_values: {action_values}")
+        print(f"Action to send: {robot_action_to_send}")
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)

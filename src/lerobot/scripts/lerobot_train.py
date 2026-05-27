@@ -58,6 +58,31 @@ from lerobot.utils.utils import (
 )
 
 
+ACT_LOG_LOSS_KEYS = ("l1_loss", "arm_l1_loss", "base_bce_loss", "kld_loss")
+
+
+def format_train_log_message(base_message: str, output_dict: dict[str, Any] | None) -> str:
+    if not output_dict:
+        return base_message
+
+    act_loss_parts = []
+    ordered_keys = list(ACT_LOG_LOSS_KEYS)
+    ordered_keys.extend(
+        key
+        for key, value in output_dict.items()
+        if key not in ACT_LOG_LOSS_KEYS and key.endswith("_loss") and isinstance(value, Real)
+    )
+    for key in ordered_keys:
+        value = output_dict.get(key)
+        if isinstance(value, Real):
+            act_loss_parts.append(f"{key}:{value:.3f}")
+
+    if not act_loss_parts:
+        return base_message
+
+    return f"{base_message} {' '.join(act_loss_parts)}"
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -188,7 +213,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             cpu=force_cpu,
         )
 
-    init_logging(log_file=cfg.output_dir / "train.log", accelerator=accelerator)
+    init_logging(log_file=cfg.train_log_file, accelerator=accelerator)
 
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
@@ -343,6 +368,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+        logging.info(colored("Train log:", "yellow", attrs=["bold"]) + f" {cfg.train_log_file}")
+        logging.info(colored("Tensorboard:", "yellow", attrs=["bold"]) + f" {cfg.tensorboard_dir}")
         logging.info(colored("TensorBoard dir:", "yellow", attrs=["bold"]) + f" {cfg.tensorboard_dir}")
         if cfg.env is not None:
             logging.info(f"{cfg.env.task=}")
@@ -454,7 +481,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
         if is_log_step:
-            logging.info(train_tracker)
+            logging.info(format_train_log_message(str(train_tracker), output_dict))
             if writer is not None:
                 for name, value in train_tracker.to_dict().items():
                     writer.add_scalar(f"train/{name}", value, step)

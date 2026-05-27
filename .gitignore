@@ -176,3 +176,9 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+outputs/
+dataset/
+docs/
+
+.claude/*

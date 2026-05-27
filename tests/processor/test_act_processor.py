@@ -26,6 +26,7 @@ from lerobot.policies.act.processor_act import (
     ExtractLeKiwiBananaTargetsProcessorStep,
     make_act_pre_post_processors,
 )
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
@@ -89,6 +90,16 @@ def create_lekiwi_banana_stats():
     }
 
 
+def create_lekiwi_banana_override_stats():
+    return {
+        OBS_STATE: {"mean": torch.zeros(9), "std": torch.ones(9)},
+        ACTION: {
+            "mean": torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.4185249]),
+            "std": torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1e-8, 1e-8, 8.1674038]),
+        },
+    }
+
+
 def create_default_stats():
     """Create default dataset statistics for testing."""
     return {
@@ -133,6 +144,21 @@ def test_extract_lekiwi_banana_targets_step():
 
     assert torch.equal(processed["base_move_target"], torch.tensor([1.0]))
     assert torch.equal(processed[TransitionKey.COMPLEMENTARY_DATA]["base_move_target"], torch.tensor([1.0]))
+
+
+def test_extract_lekiwi_banana_targets_step_skips_inference_transition_without_action():
+    step = ExtractLeKiwiBananaTargetsProcessorStep(arm_action_dim=6, base_direction_index=8)
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(9)},
+        TransitionKey.ACTION: None,
+        TransitionKey.COMPLEMENTARY_DATA: {},
+    }
+
+    processed = step(transition)
+
+    assert processed == transition
+    assert "base_move_target" not in processed
+    assert processed[TransitionKey.COMPLEMENTARY_DATA] == {}
 
 
 def test_make_act_processor_includes_lekiwi_target_extractor():
@@ -313,6 +339,45 @@ def test_act_processor_save_and_load():
         processed = loaded_preprocessor(batch)
         assert processed[OBS_STATE].shape == (1, 7)
         assert processed[TransitionKey.ACTION.value].shape == (1, 4)
+
+
+def test_make_pre_post_processors_with_pretrained_path_overrides_saved_stats():
+    config = create_lekiwi_banana_config()
+    saved_stats = create_lekiwi_banana_stats()
+    override_stats = create_lekiwi_banana_override_stats()
+
+    preprocessor, postprocessor = make_act_pre_post_processors(config, saved_stats)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        preprocessor.save_pretrained(tmpdir)
+        postprocessor.save_pretrained(tmpdir)
+
+        loaded_preprocessor, loaded_postprocessor = make_pre_post_processors(
+            config,
+            pretrained_path=tmpdir,
+            dataset_stats=override_stats,
+        )
+
+        loaded_normalizer = loaded_preprocessor.steps[-1]
+        loaded_unnormalizer = loaded_postprocessor.steps[0]
+        assert isinstance(loaded_normalizer, NormalizerProcessorStep)
+        assert isinstance(loaded_unnormalizer, UnnormalizerProcessorStep)
+
+        torch.testing.assert_close(
+            loaded_normalizer._tensor_stats[ACTION]["mean"], override_stats[ACTION]["mean"]
+        )
+        torch.testing.assert_close(
+            loaded_unnormalizer._tensor_stats[ACTION]["mean"], override_stats[ACTION]["mean"]
+        )
+
+        theta_mean = override_stats[ACTION]["mean"][8]
+        theta_std = override_stats[ACTION]["std"][8]
+        normalized_stop_value = (0.0 - theta_mean) / (theta_std + 1e-8)
+        normalized_action = torch.tensor([[[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, normalized_stop_value]]])
+
+        unnormalized_action = loaded_postprocessor(normalized_action)
+
+        assert torch.isclose(unnormalized_action[0, 0, 8], torch.tensor(0.0), atol=1e-5)
 
 
 def test_act_processor_device_placement_preservation():

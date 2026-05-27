@@ -69,6 +69,7 @@ class TrainPipelineConfig(HubMixin):
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
     tensorboard_dir: Path | None = None
+    train_log_file: Path | None = None
     peft: PeftConfig | None = None
 
     # RA-BC (Reward-Aligned Behavior Cloning) parameters
@@ -131,7 +132,10 @@ class TrainPipelineConfig(HubMixin):
             self.output_dir = Path("outputs/train") / train_dir
 
         if self.tensorboard_dir is None:
-            self.tensorboard_dir = self.output_dir / "tensorboard"
+            self.tensorboard_dir = Path("logs") / self.job_name
+
+        if self.train_log_file is None:
+            self.train_log_file = Path("logs") / f"{self.job_name}.log"
 
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
@@ -209,6 +213,8 @@ class TrainPipelineConfig(HubMixin):
                 ) from e
 
         cli_args = kwargs.pop("cli_args", [])
+        if config_file is not None:
+            config_file = parser.prepare_json_config_for_draccus(config_file)
         with draccus.config_type("json"):
             return draccus.parse(cls, config_file, args=cli_args)
 

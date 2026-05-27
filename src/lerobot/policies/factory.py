@@ -240,6 +240,22 @@ class ProcessorConfigKwargs(TypedDict, total=False):
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None
 
 
+def _merge_processor_stats_overrides(
+    overrides: dict[str, Any] | None,
+    *,
+    step_name: str,
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None,
+) -> dict[str, Any]:
+    merged_overrides = dict(overrides or {})
+    if dataset_stats is None:
+        return merged_overrides
+
+    step_overrides = dict(merged_overrides.get(step_name, {}))
+    step_overrides.setdefault("stats", dataset_stats)
+    merged_overrides[step_name] = step_overrides
+    return merged_overrides
+
+
 def make_pre_post_processors(
     policy_cfg: PreTrainedConfig,
     pretrained_path: str | None = None,
@@ -271,12 +287,28 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        preprocessor_overrides = dict(kwargs.get("preprocessor_overrides") or {})
+        postprocessor_overrides = dict(kwargs.get("postprocessor_overrides") or {})
+        dataset_stats = kwargs.get("dataset_stats")
+
+        if dataset_stats is not None and not isinstance(policy_cfg, GrootConfig):
+            preprocessor_overrides = _merge_processor_stats_overrides(
+                preprocessor_overrides,
+                step_name="normalizer_processor",
+                dataset_stats=dataset_stats,
+            )
+            postprocessor_overrides = _merge_processor_stats_overrides(
+                postprocessor_overrides,
+                step_name="unnormalizer_processor",
+                dataset_stats=dataset_stats,
+            )
+
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
             # Need to override both stats AND normalize_min_max since saved config might be empty
-            preprocessor_overrides = {}
-            postprocessor_overrides = {}
+            preprocessor_overrides = dict(preprocessor_overrides)
+            postprocessor_overrides = dict(postprocessor_overrides)
             preprocessor_overrides["groot_pack_inputs_v3"] = {
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
@@ -289,15 +321,13 @@ def make_pre_post_processors(
                 "normalize_min_max": True,
                 "env_action_dim": env_action_dim,
             }
-            kwargs["preprocessor_overrides"] = preprocessor_overrides
-            kwargs["postprocessor_overrides"] = postprocessor_overrides
 
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
             config_filename=kwargs.get(
                 "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
             ),
-            overrides=kwargs.get("preprocessor_overrides", {}),
+            overrides=preprocessor_overrides,
             to_transition=batch_to_transition,
             to_output=transition_to_batch,
         )
@@ -306,7 +336,7 @@ def make_pre_post_processors(
             config_filename=kwargs.get(
                 "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
             ),
-            overrides=kwargs.get("postprocessor_overrides", {}),
+            overrides=postprocessor_overrides,
             to_transition=policy_action_to_transition,
             to_output=transition_to_policy_action,
         )

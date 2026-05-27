@@ -1,0 +1,275 @@
+{
+    "_comment": "这是可直接训练的注释版配置。训练时会忽略所有 `_comment` 字段。更换数据集时，优先检查 dataset、policy.input_features、policy.output_features、policy.action_heads、output_dir/job_name/tensorboard_dir/train_log_file。",
+    "dataset": {
+        "_comment": "更换数据集后优先改这里：repo_id、root。episodes 一般保持 null；如果新数据集的光照、相机抖动、颜色分布差异明显，再看 image_transforms。",
+        "repo_id": "lekiwi_pick_and_put_banana_gap3",
+        "root": "/home/lwh/code/lerobot/dataset/lekiwi_pick_and_put_banana_gap3",
+        "episodes": null,
+        "image_transforms": {
+            "_comment": "可选增强配置。只有新数据集视觉分布变化明显时才建议重点调整。",
+            "enable": false,
+            "max_num_transforms": 3,
+            "random_order": false,
+            "tfs": {
+                "brightness": {
+                    "weight": 1.0,
+                    "type": "ColorJitter",
+                    "kwargs": {
+                        "brightness": [
+                            0.8,
+                            1.2
+                        ]
+                    }
+                },
+                "contrast": {
+                    "weight": 1.0,
+                    "type": "ColorJitter",
+                    "kwargs": {
+                        "contrast": [
+                            0.8,
+                            1.2
+                        ]
+                    }
+                },
+                "saturation": {
+                    "weight": 1.0,
+                    "type": "ColorJitter",
+                    "kwargs": {
+                        "saturation": [
+                            0.5,
+                            1.5
+                        ]
+                    }
+                },
+                "hue": {
+                    "weight": 1.0,
+                    "type": "ColorJitter",
+                    "kwargs": {
+                        "hue": [
+                            -0.05,
+                            0.05
+                        ]
+                    }
+                },
+                "sharpness": {
+                    "weight": 1.0,
+                    "type": "SharpnessJitter",
+                    "kwargs": {
+                        "sharpness": [
+                            0.5,
+                            1.5
+                        ]
+                    }
+                },
+                "affine": {
+                    "weight": 1.0,
+                    "type": "RandomAffine",
+                    "kwargs": {
+                        "degrees": [
+                            -5.0,
+                            5.0
+                        ],
+                        "translate": [
+                            0.05,
+                            0.05
+                        ]
+                    }
+                }
+            }
+        },
+        "revision": null,
+        "use_imagenet_stats": true,
+        "video_backend": "torchcodec",
+        "streaming": false
+    },
+    "env": null,
+    "policy": {
+        "_comment": "更换数据集后最容易漏改的一段：input_features 要和新数据集的 state 维度、图像 key、图像分辨率一致；output_features.action.shape 要和动作维度一致；action_heads 和 arm_action_dim/base_* 必须和动作语义严格对齐。",
+        "type": "act",
+        "n_obs_steps": 1,
+        "input_features": {
+            "_comment": "必查：observation.state 维度、图像 key 名称、图像分辨率是否和新数据集一致。",
+            "observation.state": {
+                "type": "STATE",
+                "shape": [
+                    9
+                ]
+            },
+            "observation.images.front": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    480,
+                    640
+                ]
+            },
+            "observation.images.wrist": {
+                "type": "VISUAL",
+                "shape": [
+                    3,
+                    480,
+                    640
+                ]
+            }
+        },
+        "output_features": {
+            "_comment": "必查：action 的 shape 必须和新数据集动作维度一致。",
+            "action": {
+                "type": "ACTION",
+                "shape": [
+                    9
+                ]
+            }
+        },
+        "device": "cuda",
+        "use_amp": true,
+        "use_peft": false,
+        "push_to_hub": false,
+        "repo_id": null,
+        "private": null,
+        "tags": null,
+        "license": null,
+        "pretrained_path": null,
+        "chunk_size": 100,
+        "n_action_steps": 50,
+        "normalization_mapping": {
+            "_comment": "通常跟着特征类型走。只有输入输出类型变更时才需要改。",
+            "VISUAL": "MEAN_STD",
+            "STATE": "MEAN_STD",
+            "ACTION": "MEAN_STD"
+        },
+        "vision_backbone": "resnet18",
+        "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1",
+        "replace_final_stride_with_dilation": 0,
+        "pre_norm": false,
+        "dim_model": 2048,
+        "n_heads": 8,
+        "dim_feedforward": 3200,
+        "feedforward_activation": "relu",
+        "n_encoder_layers": 4,
+        "n_decoder_layers": 7,
+        "use_vae": true,
+        "latent_dim": 32,
+        "n_vae_encoder_layers": 4,
+        "temporal_ensemble_coeff": null,
+        "dropout": 0.1,
+        "kl_weight": 10.0,
+        "use_split_heads": true,
+        "action_heads": [
+            {
+                "_comment": "机械臂连续动作维度。",
+                "name": "arm",
+                "type": "continuous",
+                "indices": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5
+                ],
+                "values": null,
+                "loss_weight": 1.0,
+                "threshold": 0.5,
+                "pos_weight": 1.0
+            },
+            {
+                "_comment": "底盘前进开关所在维度；binary/categorical head 只能对应 1 个 index。",
+                "name": "base_x",
+                "type": "binary",
+                "indices": [
+                    6
+                ],
+                "values": [
+                    0.0,
+                    0.1
+                ],
+                "loss_weight": 1.0,
+                "threshold": 0.5,
+                "pos_weight": 1.0
+            },
+            {
+                "_comment": "底盘转向离散维度。",
+                "name": "base_theta",
+                "type": "categorical",
+                "indices": [
+                    8
+                ],
+                "values": [
+                    -30.0,
+                    0.0,
+                    30.0
+                ],
+                "loss_weight": 2.0,
+                "threshold": 0.5,
+                "pos_weight": 1.0
+            }
+        ],
+        "arm_action_dim": 6,
+        "base_mode": "continuous",
+        "base_direction_index": 8,
+        "base_unused_indices": [
+            7
+        ],
+        "base_forward_speed": 30.0,
+        "base_move_loss_weight": 1.0,
+        "base_pos_weight": 19.3,
+        "base_move_threshold": 0.5,
+        "optimizer_lr": 1e-05,
+        "optimizer_weight_decay": 0.0001,
+        "optimizer_lr_backbone": 1e-05
+    },
+    "output_dir": "outputs_hdd/lekiwi_pick_and_put_banana_gap3",
+    "job_name": "lekiwi_pick_and_put_banana_gap3",
+    "resume": false,
+    "seed": 1000,
+    "cudnn_deterministic": false,
+    "num_workers": 4,
+    "batch_size": 48,
+    "steps": 500000,
+    "eval_freq": 0,
+    "log_freq": 100,
+    "tolerance_s": 0.0001,
+    "save_checkpoint": true,
+    "save_freq": 1000,
+    "use_policy_training_preset": true,
+    "optimizer": {
+        "type": "adamw",
+        "lr": 1e-05,
+        "weight_decay": 0.0001,
+        "grad_clip_norm": 10.0,
+        "betas": [
+            0.9,
+            0.999
+        ],
+        "eps": 1e-08
+    },
+    "scheduler": null,
+    "eval": {
+        "_comment": "如果会做在线评估，并且新任务的 episode 长度变化明显，可以再看这一段。",
+        "n_episodes": 50,
+        "batch_size": 22,
+        "use_async_envs": true
+    },
+    "wandb": {
+        "enable": false,
+        "disable_artifact": false,
+        "project": "lerobot",
+        "entity": null,
+        "notes": null,
+        "run_id": null,
+        "mode": null,
+        "add_tags": true
+    },
+    "_comment_output": "更换数据集时，建议同步修改 output_dir、job_name、tensorboard_dir、train_log_file，避免覆盖旧实验。",
+    "tensorboard_dir": "logs/lekiwi_pick_and_put_banana_gap3",
+    "train_log_file": "logs/lekiwi_pick_and_put_banana_gap3.log",
+    "peft": null,
+    "use_rabc": false,
+    "rabc_progress_path": null,
+    "rabc_kappa": 0.01,
+    "rabc_epsilon": 1e-06,
+    "rabc_head_mode": "sparse",
+    "rename_map": {},
+    "checkpoint_path": null
+}

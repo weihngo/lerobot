@@ -65,6 +65,14 @@ def _assemble_lekiwi_banana_action(
     return torch.cat([arm_action, zeros, zeros, theta], dim=-1)
 
 
+def _action_head_loss_key(name: str, head_type: str) -> str:
+    if head_type == "continuous":
+        return f"{name}_l1_loss"
+    if head_type == "binary":
+        return "base_bce_loss" if name == "base_move" else f"{name}_bce_loss"
+    return f"{name}_ce_loss"
+
+
 class ACTPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -91,22 +99,49 @@ class ACTPolicy(PreTrainedPolicy):
         self.dataset_stats = dataset_stats
 
         self.model = ACT(config)
-        self._binary_base_stop_value = 0.0
-        self._binary_base_move_value = config.base_forward_speed
-        if dataset_stats is not None and ACTION in dataset_stats:
-            action_stats = dataset_stats[ACTION]
-            mean = torch.as_tensor(action_stats["mean"], dtype=torch.float32)
-            std = torch.as_tensor(action_stats["std"], dtype=torch.float32)
-            if mean.numel() > config.base_direction_index and std.numel() > config.base_direction_index:
-                theta_mean = mean[config.base_direction_index]
-                theta_std = std[config.base_direction_index] + 1e-8
-                self._binary_base_stop_value = ((0.0 - theta_mean) / theta_std).item()
-                self._binary_base_move_value = ((config.base_forward_speed - theta_mean) / theta_std).item()
+        self._discrete_head_output_values = self._build_discrete_head_output_values(dataset_stats)
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
         self.reset()
+
+    def _build_discrete_head_output_values(
+        self, dataset_stats: dict[str, dict[str, Tensor]] | None
+    ) -> dict[str, Tensor]:
+        discrete_head_values = {}
+        for head in self.config.action_heads:
+            if head.type == "continuous" or head.values is None:
+                continue
+            values = torch.tensor(head.values, dtype=torch.float32)
+            if dataset_stats is not None and ACTION in dataset_stats:
+                action_stats = dataset_stats[ACTION]
+                mean = torch.as_tensor(action_stats["mean"], dtype=torch.float32)
+                std = torch.as_tensor(action_stats["std"], dtype=torch.float32)
+                action_index = head.indices[0]
+                if mean.numel() > action_index and std.numel() > action_index:
+                    values = (values - mean[action_index]) / (std[action_index] + 1e-8)
+            discrete_head_values[head.name] = values
+        return discrete_head_values
+
+    def _assemble_action_chunk(self, head_outputs: dict[str, Tensor]) -> Tensor:
+        reference = next(iter(head_outputs.values()))
+        actions = reference.new_zeros(reference.shape[:2] + (self.config.action_feature.shape[0],))
+        for head in self.config.action_heads:
+            output = head_outputs[head.name]
+            if head.type == "continuous":
+                actions[..., head.indices] = output
+                continue
+
+            discrete_values = self._discrete_head_output_values[head.name].to(
+                device=output.device, dtype=output.dtype
+            )
+            if head.type == "binary":
+                class_indices = (torch.sigmoid(output) > head.threshold).to(torch.long).squeeze(-1)
+            else:
+                class_indices = output.argmax(dim=-1)
+            actions[..., head.indices] = discrete_values[class_indices].unsqueeze(-1)
+        return actions
 
     def get_optim_params(self) -> dict:
         # TODO(aliberts, rcadene): As of now, lr_backbone == lr
@@ -171,16 +206,8 @@ class ACTPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         model_output, _ = self.model(batch)
-        if self.config.use_split_heads and self.config.base_mode == "binary_move":
-            arm_actions, base_move_logits = model_output
-            actions = _assemble_lekiwi_banana_action(
-                arm_actions,
-                torch.sigmoid(base_move_logits),
-                threshold=self.config.base_move_threshold,
-                forward_speed=self.config.base_forward_speed,
-                stop_value=self._binary_base_stop_value,
-                move_value=self._binary_base_move_value,
-            )
+        if self.config.use_split_heads and self.config.action_heads:
+            actions = self._assemble_action_chunk(model_output)
         else:
             actions = model_output
         return actions
@@ -193,28 +220,37 @@ class ACTPolicy(PreTrainedPolicy):
 
         model_output, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
-        if self.config.use_split_heads and self.config.base_mode == "binary_move":
-            arm_actions_hat, base_move_logits = model_output
-            valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
-            arm_target = batch[ACTION][..., : self.config.arm_action_dim]
-            arm_l1_loss = (F.l1_loss(arm_target, arm_actions_hat, reduction="none") * valid_mask).mean()
-            pos_weight = base_move_logits.new_tensor([self.config.base_pos_weight])
-            base_move_target = batch["base_move_target"].to(dtype=base_move_logits.dtype)
-            base_bce_loss = (
-                F.binary_cross_entropy_with_logits(
-                    base_move_logits,
-                    base_move_target,
-                    reduction="none",
-                    pos_weight=pos_weight,
-                )
-                * valid_mask
-            ).mean()
-            loss = arm_l1_loss + self.config.base_move_loss_weight * base_bce_loss
-            loss_dict = {
-                "arm_l1_loss": arm_l1_loss.item(),
-                "base_bce_loss": base_bce_loss.item(),
-            }
-            reconstruction_loss = arm_l1_loss + self.config.base_move_loss_weight * base_bce_loss
+        if self.config.use_split_heads and self.config.action_heads:
+            valid_mask = ~batch["action_is_pad"]
+            reconstruction_loss = batch[ACTION].new_tensor(0.0)
+            loss_dict = {}
+            for head in self.config.action_heads:
+                head_output = model_output[head.name]
+                if head.type == "continuous":
+                    head_target = batch[ACTION][..., head.indices]
+                    head_loss = (
+                        F.l1_loss(head_target, head_output, reduction="none") * valid_mask.unsqueeze(-1)
+                    ).mean()
+                elif head.type == "binary":
+                    head_target = batch[f"{head.name}_target"].to(dtype=head_output.dtype)
+                    pos_weight = head_output.new_tensor([head.pos_weight])
+                    head_loss = (
+                        F.binary_cross_entropy_with_logits(
+                            head_output,
+                            head_target,
+                            reduction="none",
+                            pos_weight=pos_weight,
+                        )
+                        * valid_mask.unsqueeze(-1)
+                    ).mean()
+                else:
+                    head_target = batch[f"{head.name}_target"].to(dtype=torch.long)
+                    head_loss = (
+                        F.cross_entropy(head_output.transpose(1, 2), head_target, reduction="none") * valid_mask
+                    ).mean()
+                reconstruction_loss = reconstruction_loss + head.loss_weight * head_loss
+                loss_dict[_action_head_loss_key(head.name, head.type)] = head_loss.item()
+            loss = reconstruction_loss
         else:
             actions_hat = model_output
             l1_loss = (
@@ -440,9 +476,16 @@ class ACT(nn.Module):
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
 
         # Final action head(s) on the output of the transformer's decoder.
-        if self.config.use_split_heads and self.config.base_mode == "binary_move":
-            self.arm_action_head = nn.Linear(config.dim_model, self.config.arm_action_dim)
-            self.base_move_head = nn.Linear(config.dim_model, 1)
+        if self.config.use_split_heads and self.config.action_heads:
+            self.split_action_heads = nn.ModuleDict()
+            for head in self.config.action_heads:
+                if head.type == "continuous":
+                    output_dim = len(head.indices)
+                elif head.type == "binary":
+                    output_dim = 1
+                else:
+                    output_dim = len(head.values) if head.values is not None else 0
+                self.split_action_heads[head.name] = nn.Linear(config.dim_model, output_dim)
         else:
             self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
 
@@ -454,7 +497,9 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    def forward(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[Tensor | dict[str, Tensor], tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
@@ -584,8 +629,11 @@ class ACT(nn.Module):
         # Move back to (B, S, C).
         decoder_out = decoder_out.transpose(0, 1)
 
-        if self.config.use_split_heads and self.config.base_mode == "binary_move":
-            return (self.arm_action_head(decoder_out), self.base_move_head(decoder_out)), (mu, log_sigma_x2)
+        if self.config.use_split_heads and self.config.action_heads:
+            return (
+                {name: head(decoder_out) for name, head in self.split_action_heads.items()},
+                (mu, log_sigma_x2),
+            )
 
         actions = self.action_head(decoder_out)
         return actions, (mu, log_sigma_x2)

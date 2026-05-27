@@ -14,9 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from datetime import datetime
+from copy import deepcopy
+from pathlib import Path
+
+import torch
+
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.factory import IMAGENET_STATS
 from lerobot.datasets.feature_utils import hw_to_dataset_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor import make_default_processors
 from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig
@@ -28,20 +37,67 @@ from lerobot.utils.visualization_utils import init_rerun
 
 NUM_EPISODES = 2
 FPS = 30
-EPISODE_TIME_SEC = 60
-TASK_DESCRIPTION = "My task description"
-HF_MODEL_ID = "<hf_username>/<model_repo_id>"
-HF_DATASET_ID = "<hf_username>/<eval_dataset_repo_id>"
+EPISODE_TIME_SEC = 180
+TASK_DESCRIPTION = "pick and put banana"
+HF_MODEL_ID = "/home/lwh/code/lerobot/outputs_hdd/find_and_walk_banana_gap10/checkpoints/last/pretrained_model"
+HF_DATASET_ID = "lwh/pi05"
+TRAIN_STATS_DATASET_ID: str | None = None
+TRAIN_STATS_DATASET_ROOT: Path | None = None
+
+TRAIN_STATS_DATASET_ID = "lekiwi_pick_and_put_banana"
+TRAIN_STATS_DATASET_ROOT = Path("/mnt/data/yzh/dataset/lekiwi_pick_and_put_banana")
+
+
+def resolve_job_name_from_pretrained_path(pretrained_path: str | Path) -> str:
+    path = Path(pretrained_path)
+    if "checkpoints" in path.parts:
+        checkpoint_index = path.parts.index("checkpoints")
+        if checkpoint_index > 0:
+            return path.parts[checkpoint_index - 1]
+    return path.name or path.stem
+
+
+def resolve_control_log_path(pretrained_path: str | Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"lekiwi_control_{timestamp}.txt"
+    return Path("logs") / resolve_job_name_from_pretrained_path(pretrained_path) / filename
+
+
+def append_control_log(log_path: Path, action: dict[str, float]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().isoformat(timespec="milliseconds")
+    action_str = " ".join(f"{key}={value}" for key, value in sorted(action.items()))
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"{timestamp} {action_str}\n")
+
+def resolve_policy_stats(
+    *,
+    eval_dataset_stats,
+    train_dataset_repo_id: str | None,
+    train_dataset_root: Path | None,
+):
+    if train_dataset_repo_id is None:
+        return eval_dataset_stats
+
+    train_meta = LeRobotDatasetMetadata(repo_id=train_dataset_repo_id, root=train_dataset_root)
+    train_meta = deepcopy(train_meta)
+    for camera_key in getattr(train_meta, "camera_keys", []):
+        if camera_key not in train_meta.stats:
+            continue
+        for stats_type, stats in IMAGENET_STATS.items():
+            train_meta.stats[camera_key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+    return train_meta.stats
+
+
+def load_policy_for_evaluate(*, pretrained_path: str | Path, dataset_stats):
+    return ACTPolicy.from_pretrained(pretrained_path, dataset_stats=dataset_stats)
 
 
 def main():
     # Create the robot configuration & robot
-    robot_config = LeKiwiClientConfig(remote_ip="172.18.134.136", id="lekiwi")
+    robot_config = LeKiwiClientConfig(remote_ip="192.168.10.102", id="lekiwi")
 
     robot = LeKiwiClient(robot_config)
-
-    # Create policy
-    policy = ACTPolicy.from_pretrained(HF_MODEL_ID)
 
     # Configure the dataset features
     action_features = hw_to_dataset_features(robot.action_features, ACTION)
@@ -58,11 +114,23 @@ def main():
         image_writer_threads=4,
     )
 
+    policy_stats = resolve_policy_stats(
+        eval_dataset_stats=dataset.meta.stats,
+        train_dataset_repo_id=TRAIN_STATS_DATASET_ID,
+        train_dataset_root=TRAIN_STATS_DATASET_ROOT,
+    )
+
+    # Create policy
+    policy = load_policy_for_evaluate(
+        pretrained_path=HF_MODEL_ID,
+        dataset_stats=policy_stats,
+    )
+
     # Build Policy Processors
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy,
         pretrained_path=HF_MODEL_ID,
-        dataset_stats=dataset.meta.stats,
+        dataset_stats=policy_stats,
         # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
         preprocessor_overrides={"device_processor": {"device": str(policy.config.device)}},
     )
@@ -72,7 +140,21 @@ def main():
     robot.connect()
 
     # TODO(Steven): Update this example to use pipelines
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    teleop_action_processor, base_robot_action_processor, robot_observation_processor = make_default_processors()
+    control_log_path = resolve_control_log_path(HF_MODEL_ID)
+
+    import math
+    def robot_action_processor(action_and_observation):
+        robot_action = base_robot_action_processor(action_and_observation)
+        for key in ("x.vel", "y.vel", "theta.vel"):                                                                                                                                                         
+            if key in robot_action:   
+                # 如果float类型的值是nan，则赋值0.1，否则转换为int
+                if math.isnan(robot_action[key]):
+                    robot_action[key] = 0.1
+                else:
+                    robot_action[key] = int(robot_action[key])
+        append_control_log(control_log_path, robot_action)
+        return robot_action
 
     # Initialize the keyboard listener and rerun visualization
     listener, events = init_keyboard_listener()
@@ -139,7 +221,7 @@ def main():
         listener.stop()
 
         dataset.finalize()
-        dataset.push_to_hub()
+        # dataset.push_to_hub()
 
 
 if __name__ == "__main__":

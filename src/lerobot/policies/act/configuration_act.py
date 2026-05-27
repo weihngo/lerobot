@@ -20,6 +20,17 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 
 
+@dataclass
+class ACTActionHeadConfig:
+    name: str
+    type: str
+    indices: list[int]
+    values: list[float] | None = None
+    loss_weight: float = 1.0
+    threshold: float = 0.5
+    pos_weight: float = 1.0
+
+
 @PreTrainedConfig.register_subclass("act")
 @dataclass
 class ACTConfig(PreTrainedConfig):
@@ -123,6 +134,7 @@ class ACTConfig(PreTrainedConfig):
     dropout: float = 0.1
     kl_weight: float = 10.0
     use_split_heads: bool = False
+    action_heads: list[ACTActionHeadConfig] = field(default_factory=list)
     arm_action_dim: int = 6
     base_mode: str = "continuous"
     base_direction_index: int = 8
@@ -160,16 +172,83 @@ class ACTConfig(PreTrainedConfig):
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
         if self.use_split_heads:
-            if self.arm_action_dim <= 0:
-                raise ValueError(f"`arm_action_dim` must be positive. Got {self.arm_action_dim}.")
-            if self.base_mode not in {"continuous", "binary_move"}:
+            if self.action_heads:
+                self._validate_action_heads()
+            elif self.base_mode == "binary_move":
+                self._validate_legacy_split_head_config()
+                self.action_heads = self._build_legacy_action_heads()
+            elif self.base_mode != "continuous":
                 raise ValueError(f"Unsupported `base_mode`: {self.base_mode}.")
-            if self.base_direction_index in self.base_unused_indices:
+            else:
                 raise ValueError(
-                    "`base_direction_index` must not overlap with `base_unused_indices` when using split heads."
+                    "Set `action_heads` when `use_split_heads=True`, or use legacy `base_mode='binary_move'`."
                 )
-            if self.base_pos_weight <= 0:
-                raise ValueError(f"`base_pos_weight` must be positive. Got {self.base_pos_weight}.")
+
+    def _validate_legacy_split_head_config(self) -> None:
+        if self.arm_action_dim <= 0:
+            raise ValueError(f"`arm_action_dim` must be positive. Got {self.arm_action_dim}.")
+        if self.base_direction_index in self.base_unused_indices:
+            raise ValueError(
+                "`base_direction_index` must not overlap with `base_unused_indices` when using split heads."
+            )
+        if self.base_pos_weight <= 0:
+            raise ValueError(f"`base_pos_weight` must be positive. Got {self.base_pos_weight}.")
+
+    def _build_legacy_action_heads(self) -> list[ACTActionHeadConfig]:
+        return [
+            ACTActionHeadConfig(
+                name="arm",
+                type="continuous",
+                indices=list(range(self.arm_action_dim)),
+            ),
+            ACTActionHeadConfig(
+                name="base_move",
+                type="binary",
+                indices=[self.base_direction_index],
+                values=[0.0, self.base_forward_speed],
+                loss_weight=self.base_move_loss_weight,
+                threshold=self.base_move_threshold,
+                pos_weight=self.base_pos_weight,
+            ),
+        ]
+
+    def _validate_action_heads(self) -> None:
+        seen_names: set[str] = set()
+        seen_indices: set[int] = set()
+        for head in self.action_heads:
+            if head.name in seen_names:
+                raise ValueError(f"Duplicate action head name: {head.name}")
+            seen_names.add(head.name)
+            if not head.indices:
+                raise ValueError(f"Action head '{head.name}' must define at least one index.")
+            if len(set(head.indices)) != len(head.indices):
+                raise ValueError(f"Action head '{head.name}' has duplicate indices: {head.indices}")
+            overlapping = seen_indices.intersection(head.indices)
+            if overlapping:
+                raise ValueError(
+                    f"Action head '{head.name}' overlaps with other heads on indices {sorted(overlapping)}."
+                )
+            seen_indices.update(head.indices)
+            if head.loss_weight <= 0:
+                raise ValueError(f"Action head '{head.name}' must have a positive loss_weight.")
+            if head.type == "continuous":
+                continue
+            if head.values is None:
+                raise ValueError(f"Action head '{head.name}' must define `values` for discrete outputs.")
+            if len(head.indices) != 1:
+                raise ValueError(f"Discrete action head '{head.name}' must map exactly one action index.")
+            if head.type == "binary":
+                if len(head.values) != 2:
+                    raise ValueError(f"Binary action head '{head.name}' must define exactly 2 values.")
+                if head.pos_weight <= 0:
+                    raise ValueError(f"Binary action head '{head.name}' must have a positive pos_weight.")
+            elif head.type == "categorical":
+                if len(head.values) < 2:
+                    raise ValueError(
+                        f"Categorical action head '{head.name}' must define at least 2 values."
+                    )
+            else:
+                raise ValueError(f"Unsupported action head type '{head.type}' for head '{head.name}'.")
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
