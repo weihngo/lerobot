@@ -24,6 +24,14 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import OBS_IMAGES
 
 
+@dataclass
+class SmolVLAActionHeadConfig:
+    name: str
+    head_type: str
+    index: int
+    values: list[float]
+    loss_weight: float = 1.0
+
 @PreTrainedConfig.register_subclass("smolvla")
 @dataclass
 class SmolVLAConfig(PreTrainedConfig):
@@ -43,6 +51,19 @@ class SmolVLAConfig(PreTrainedConfig):
     # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
+
+    # Mixed-action / discrete base heads
+    use_discrete_base_heads: bool = False
+    arm_passthrough_dims: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5])
+    base_action_dims: list[int] = field(default_factory=lambda: [6, 7, 8])
+    export_action_dim: int = 9
+    action_heads: list[SmolVLAActionHeadConfig] = field(
+        default_factory=lambda: [
+            SmolVLAActionHeadConfig("base_x", "categorical", 6, [-0.25, 0.0, 0.25]),
+            SmolVLAActionHeadConfig("base_y", "categorical", 7, [-0.25, 0.0, 0.25]),
+            SmolVLAActionHeadConfig("base_theta", "categorical", 8, [-0.25, 0.0, 0.25]),
+        ]
+    )
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -122,6 +143,61 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+
+        # Mixed-action validation
+        if self.use_discrete_base_heads:
+            # export_action_dim for LeKiwi mixed-action mode is fixed to 9
+            if self.export_action_dim != 9:
+                raise ValueError("LeKiwi mixed-action mode requires export_action_dim=9.")
+
+            # arm_passthrough_dims indices must be within [0, export_action_dim)
+            bad_arm_indices = [idx for idx in self.arm_passthrough_dims if idx < 0 or idx >= self.export_action_dim]
+            if bad_arm_indices:
+                raise ValueError(
+                    f"arm_passthrough_dims indices {sorted(bad_arm_indices)} out of range for export_action_dim={self.export_action_dim}"
+                )
+
+            # arm_passthrough_dims must not contain duplicate indices
+            dup_arm = sorted({x for x in self.arm_passthrough_dims if self.arm_passthrough_dims.count(x) > 1})
+            if dup_arm:
+                raise ValueError(f"arm_passthrough_dims contain duplicate indices: {dup_arm}")
+
+            head_indices = [head.index for head in self.action_heads]
+
+            # action_heads indices must be within [0, export_action_dim)
+            bad_head_indices = [idx for idx in head_indices if idx < 0 or idx >= self.export_action_dim]
+            if bad_head_indices:
+                raise ValueError(
+                    f"action_heads contain indices {sorted(bad_head_indices)} out of range for export_action_dim={self.export_action_dim}"
+                )
+
+            # action_heads indices must be unique
+            dup_heads = sorted({x for x in head_indices if head_indices.count(x) > 1})
+            if dup_heads:
+                raise ValueError(f"action_heads contain duplicate indices: {dup_heads}")
+
+            # arm_passthrough_dims and action_heads must not overlap
+            overlap = set(self.arm_passthrough_dims) & set(head_indices)
+            if overlap:
+                raise ValueError(f"arm_passthrough_dims overlap with action_heads: {sorted(overlap)}")
+
+            # base_action_dims must not contain duplicate indices
+            dup_base = sorted({x for x in self.base_action_dims if self.base_action_dims.count(x) > 1})
+            if dup_base:
+                raise ValueError(f"base_action_dims contain duplicate indices: {dup_base}")
+
+            # base_action_dims must match the indices used by action_heads
+            if set(self.base_action_dims) != set(head_indices):
+                raise ValueError(
+                    f"base_action_dims {self.base_action_dims} do not match action_heads indices {sorted(head_indices)}"
+                )
+
+            # The exported action dimension must equal the sum of passthrough and head dims
+            if len(self.arm_passthrough_dims) + len(self.action_heads) != self.export_action_dim:
+                raise ValueError(
+                    f"len(arm_passthrough_dims) + len(action_heads) must equal export_action_dim. Got "
+                    f"{len(self.arm_passthrough_dims)} + {len(self.action_heads)} != {self.export_action_dim}"
+                )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

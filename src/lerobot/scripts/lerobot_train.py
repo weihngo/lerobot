@@ -83,6 +83,28 @@ def format_train_log_message(base_message: str, output_dict: dict[str, Any] | No
     return f"{base_message} {' '.join(act_loss_parts)}"
 
 
+def resolve_processor_pretrained_path(policy_cfg, resume: bool) -> str | None:
+    processor_pretrained_path = policy_cfg.pretrained_path
+    if processor_pretrained_path is None or resume:
+        return processor_pretrained_path
+
+    if getattr(policy_cfg, "use_relative_actions", False):
+        logging.warning(
+            "use_relative_actions=true with pretrained processors can skip relative transforms if "
+            "the checkpoint processors do not define them. Building processors from current policy config."
+        )
+        return None
+
+    if getattr(policy_cfg, "use_discrete_base_heads", False):
+        logging.warning(
+            "use_discrete_base_heads=true requires the current local mixed-action processors. "
+            "Skipping pretrained processors and rebuilding them from the current policy config."
+        )
+        return None
+
+    return processor_pretrained_path
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -279,17 +301,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
-    processor_pretrained_path = cfg.policy.pretrained_path
-    if (
-        getattr(cfg.policy, "use_relative_actions", False)
-        and processor_pretrained_path is not None
-        and not cfg.resume
-    ):
-        logging.warning(
-            "use_relative_actions=true with pretrained processors can skip relative transforms if "
-            "the checkpoint processors do not define them. Building processors from current policy config."
-        )
-        processor_pretrained_path = None
+    processor_pretrained_path = resolve_processor_pretrained_path(cfg.policy, resume=cfg.resume)
 
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}

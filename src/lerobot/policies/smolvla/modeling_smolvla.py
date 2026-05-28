@@ -63,6 +63,7 @@ from torch import Tensor, nn
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.processor_smolvla import SMOLVLA_ARM_STATE_KEY
 from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.utils import (
     populate_queues,
@@ -291,9 +292,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
             images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
         )
 
-        # Unpad actions
-        original_action_dim = self.config.action_feature.shape[0]
-        actions = actions[:, :, :original_action_dim]
+        if self.config.use_discrete_base_heads:
+            arm_state = batch.get(SMOLVLA_ARM_STATE_KEY)
+            if arm_state is None:
+                raise RuntimeError(
+                    f"Mixed-action SmolVLA requires '{SMOLVLA_ARM_STATE_KEY}' in the preprocessed batch."
+                )
+            actions = self._decode_discrete_action_chunk(actions, arm_state)
+        else:
+            original_action_dim = self.config.action_feature.shape[0]
+            actions = actions[:, :, :original_action_dim]
 
         if self.config.adapt_to_pi_aloha:
             actions = self._pi_aloha_encode_actions(actions)
@@ -376,18 +384,25 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
-        original_action_dim = self.config.action_feature.shape[0]
-        losses = losses[:, :, :original_action_dim]
-        loss_dict["losses_after_forward"] = losses.clone().mean().item()
+
+        if getattr(self.config, "use_discrete_base_heads", False):
+            logits = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+            losses = self._compute_discrete_head_losses(logits=logits, batch=batch, loss_dict=loss_dict)
+            loss_dict["losses_after_forward"] = losses.clone().mean().item()
+        else:
+            # Default continuous flow path
+            losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+            original_action_dim = self.config.action_feature.shape[0]
+            losses = losses[:, :, :original_action_dim]
+            loss_dict["losses_after_forward"] = losses.clone().mean().item()
 
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
             losses = losses * in_episode_bound.unsqueeze(-1)
             loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
 
-        # Remove padding
-        losses = losses[:, :, : self.config.max_action_dim]
+        if not getattr(self.config, "use_discrete_base_heads", False):
+            losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
         if reduction == "none":
@@ -400,6 +415,60 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss = losses.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
+
+    def _compute_discrete_head_losses(
+        self, logits: dict[str, Tensor], batch: dict[str, Tensor], loss_dict: dict[str, float]
+    ) -> Tensor:
+        head_losses = []
+        total_weight = 0.0
+        for head in self.config.action_heads:
+            logits_name = f"{head.name}_logits"
+            target_name = f"{head.name}_target"
+            if logits_name not in logits:
+                raise RuntimeError(f"Expected logits for head '{head.name}' as '{logits_name}' in model output")
+            if target_name not in batch:
+                raise RuntimeError(f"Expected target '{target_name}' in training batch for mixed-action mode")
+
+            head_logits = logits[logits_name]
+            if head_logits.ndim != 3:
+                raise RuntimeError(
+                    f"Expected logits for head '{head.name}' to have shape (B, T, C), got {head_logits.shape}"
+                )
+
+            targets = batch[target_name].long()
+            if targets.ndim == 1:
+                targets = targets.unsqueeze(1).expand(head_logits.shape[0], head_logits.shape[1])
+            ce = F.cross_entropy(
+                head_logits.reshape(-1, head_logits.shape[-1]),
+                targets.reshape(-1),
+                reduction="none",
+            ).view(head_logits.shape[0], head_logits.shape[1])
+            head_losses.append(ce * head.loss_weight)
+            total_weight += head.loss_weight
+            loss_dict[f"{head.name}_ce"] = ce.mean().item()
+
+        if total_weight <= 0:
+            raise RuntimeError("Mixed-action loss weights must sum to a positive value.")
+
+        aggregated = torch.stack(head_losses, dim=-1).sum(dim=-1, keepdim=True) / total_weight
+        return aggregated
+
+    def _decode_discrete_action_chunk(self, logits: dict[str, Tensor], arm_state: Tensor) -> Tensor:
+        first_logits = logits[f"{self.config.action_heads[0].name}_logits"]
+        prefix_shape = torch.argmax(first_logits, dim=-1).shape
+        actions = arm_state.new_zeros(*prefix_shape, self.config.export_action_dim)
+        passthrough = arm_state[..., self.config.arm_passthrough_dims]
+        while passthrough.ndim < actions.ndim:
+            passthrough = passthrough.unsqueeze(-2)
+        actions[..., self.config.arm_passthrough_dims] = passthrough.expand(
+            *prefix_shape, len(self.config.arm_passthrough_dims)
+        )
+        for head in self.config.action_heads:
+            head_logits = logits[f"{head.name}_logits"]
+            class_ids = torch.argmax(head_logits, dim=-1)
+            values = actions.new_tensor(head.values)
+            actions[..., head.index] = values[class_ids]
+        return actions
 
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
@@ -574,6 +643,12 @@ class VLAFlowMatching(nn.Module):
         )
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+        self.discrete_action_heads = nn.ModuleDict(
+            {
+                head.name: nn.Linear(self.vlm_with_expert.expert_hidden_size, len(head.values))
+                for head in self.config.action_heads
+            }
+        )
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -764,6 +839,9 @@ class VLAFlowMatching(nn.Module):
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        if self.config.use_discrete_base_heads:
+            return self._forward_discrete_action_heads(images, img_masks, lang_tokens, lang_masks, state, actions)
+
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -809,6 +887,24 @@ class VLAFlowMatching(nn.Module):
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        if self.config.use_discrete_base_heads:
+            if self._rtc_enabled():
+                raise NotImplementedError("RTC is not supported in SmolVLA mixed-action mode.")
+            return self._forward_discrete_action_heads(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                torch.zeros(
+                    state.shape[0],
+                    self.config.chunk_size,
+                    self.config.max_action_dim,
+                    device=state.device,
+                    dtype=state.dtype,
+                ),
+            )
+
         bsize = state.shape[0]
         device = state.device
 
@@ -903,3 +999,39 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         return v_t
+
+    def _forward_discrete_action_heads(self, images, img_masks, lang_tokens, lang_masks, state, actions):
+        batch_size = state.shape[0]
+        if actions.ndim != 3:
+            raise RuntimeError(f"Expected actions to have shape (B, T, D) in mixed-action mode, got {actions.shape}")
+
+        zero_actions = torch.zeros(
+            batch_size,
+            actions.shape[1],
+            self.config.max_action_dim,
+            device=state.device,
+            dtype=actions.dtype,
+        )
+        timestep = torch.zeros(batch_size, dtype=torch.float32, device=state.device)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(zero_actions, timestep)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        suffix_out = suffix_out[:, -actions.shape[1] :].to(dtype=torch.float32)
+        return {
+            f"{head.name}_logits": self.discrete_action_heads[head.name](suffix_out)
+            for head in self.config.action_heads
+        }

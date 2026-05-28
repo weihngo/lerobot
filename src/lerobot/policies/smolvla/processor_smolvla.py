@@ -14,12 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAActionHeadConfig, SmolVLAConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     ComplementaryDataProcessorStep,
@@ -27,13 +28,17 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStep,
     ProcessorStepRegistry,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
+    TransitionKey,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
-from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import OBS_STATE, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+SMOLVLA_ARM_STATE_KEY = "smolvla.arm_passthrough_state"
 
 
 def make_smolvla_pre_post_processors(
@@ -66,6 +71,7 @@ def make_smolvla_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    extract_step = None
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
@@ -76,19 +82,44 @@ def make_smolvla_pre_post_processors(
             padding_side="right",
             max_length=config.tokenizer_max_length,
         ),
-        DeviceProcessorStep(device=config.device),
-        NormalizerProcessorStep(
-            features={**config.input_features, **config.output_features},
-            norm_map=config.normalization_mapping,
-            stats=dataset_stats,
-        ),
     ]
-    output_steps = [
-        UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
-        ),
-        DeviceProcessorStep(device="cpu"),
-    ]
+
+    if config.use_discrete_base_heads:
+        extract_step = ExtractDiscreteBaseTargetsProcessorStep(action_heads=config.action_heads)
+        input_steps.append(extract_step)
+
+    input_steps.extend(
+        [
+            DeviceProcessorStep(device=config.device),
+            NormalizerProcessorStep(
+                features={**config.input_features, **config.output_features},
+                norm_map=config.normalization_mapping,
+                stats=dataset_stats,
+            ),
+        ]
+    )
+
+    output_steps = []
+
+    if config.use_discrete_base_heads:
+        output_steps.append(
+            AssembleLeKiwiPassthroughActionProcessorStep(
+                arm_passthrough_dims=config.arm_passthrough_dims,
+                base_action_dims=config.base_action_dims,
+                export_action_dim=config.export_action_dim,
+                action_heads=config.action_heads,
+                extract_step=extract_step,
+            )
+        )
+    else:
+        output_steps.append(
+            UnnormalizerProcessorStep(
+                features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            )
+        )
+
+    # Move to CPU as last step
+    output_steps.append(DeviceProcessorStep(device="cpu"))
     return (
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
             steps=input_steps,
@@ -138,4 +169,85 @@ class SmolVLANewLineProcessor(ComplementaryDataProcessorStep):
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="extract_discrete_base_targets")
+class ExtractDiscreteBaseTargetsProcessorStep(ProcessorStep):
+    action_heads: list[SmolVLAActionHeadConfig]
+    _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
+
+    def __call__(self, transition):
+        new_transition = dict(transition)
+        observation = new_transition.get(TransitionKey.OBSERVATION) or {}
+        complementary_data = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}))
+
+        state = observation.get(OBS_STATE) if isinstance(observation, dict) else None
+        if state is not None:
+            self._last_state = state
+            complementary_data[SMOLVLA_ARM_STATE_KEY] = state
+
+        action = new_transition.get(TransitionKey.ACTION)
+        if action is None:
+            if complementary_data:
+                new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+            return new_transition
+
+        action = torch.as_tensor(action)
+        for head in self.action_heads:
+            values = action.new_tensor(head.values)
+            raw_value = action[..., head.index]
+            class_id = torch.argmin(torch.abs(raw_value.unsqueeze(-1) - values), dim=-1)
+            complementary_data[f"{head.name}_target"] = class_id.to(torch.long)
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
+        return new_transition
+
+    def transform_features(self, features):
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="assemble_lekiwi_passthrough_action")
+class AssembleLeKiwiPassthroughActionProcessorStep(ProcessorStep):
+    arm_passthrough_dims: list[int]
+    base_action_dims: list[int]
+    export_action_dim: int
+    action_heads: list[SmolVLAActionHeadConfig]
+    extract_step: ExtractDiscreteBaseTargetsProcessorStep | None = field(default=None, repr=False)
+
+    def __call__(self, transition):
+        head_outputs = transition[TransitionKey.ACTION]
+        if isinstance(head_outputs, torch.Tensor):
+            return transition
+        if not isinstance(head_outputs, dict):
+            raise ValueError(f"Expected action to be tensor or dict, got {type(head_outputs)}")
+
+        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
+        state = complementary_data.get(SMOLVLA_ARM_STATE_KEY)
+        if state is None and self.extract_step is not None:
+            state = self.extract_step._last_state
+        if state is None:
+            raise RuntimeError(
+                "AssembleLeKiwiPassthroughActionProcessorStep requires cached raw state from "
+                "ExtractDiscreteBaseTargetsProcessorStep before it can restore arm passthrough dims."
+            )
+
+        first_logits = head_outputs[f"{self.action_heads[0].name}_logits"]
+        prefix_shape = torch.argmax(first_logits, dim=-1).shape
+        action = state.new_zeros(*prefix_shape, self.export_action_dim)
+        passthrough = state[..., self.arm_passthrough_dims]
+        while passthrough.ndim < action.ndim:
+            passthrough = passthrough.unsqueeze(-2)
+        action[..., self.arm_passthrough_dims] = passthrough.expand(*prefix_shape, len(self.arm_passthrough_dims))
+        for head in self.action_heads:
+            logits = head_outputs[f"{head.name}_logits"]
+            class_id = torch.argmax(logits, dim=-1)
+            values = action.new_tensor(head.values)
+            action[..., head.index] = values[class_id]
+        new_transition = dict(transition)
+        new_transition[TransitionKey.ACTION] = action
+        return new_transition
+
+    def transform_features(self, features):
         return features
