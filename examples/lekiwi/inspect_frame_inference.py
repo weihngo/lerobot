@@ -17,6 +17,7 @@
 import argparse
 import csv
 import json
+import logging
 from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
@@ -248,13 +249,36 @@ def load_policy_and_processors(
         policy_cfg.device = device
 
     policy = make_policy(cfg=policy_cfg, ds_meta=dataset_meta)
+    processor_pretrained_path = resolve_processor_pretrained_path(policy.config)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy.config,
-        pretrained_path=str(policy_path),
+        pretrained_path=processor_pretrained_path,
         dataset_stats=stats_meta.stats,
         preprocessor_overrides={"device_processor": {"device": str(policy.config.device)}},
     )
     return policy, preprocessor, postprocessor
+
+
+def resolve_processor_pretrained_path(policy_cfg) -> str | None:
+    processor_pretrained_path = policy_cfg.pretrained_path
+    if processor_pretrained_path is None:
+        return processor_pretrained_path
+
+    if getattr(policy_cfg, "use_relative_actions", False):
+        logging.warning(
+            "use_relative_actions=true with pretrained processors can skip relative transforms if "
+            "the checkpoint processors do not define them. Building processors from current policy config."
+        )
+        return None
+
+    if getattr(policy_cfg, "use_discrete_base_heads", False):
+        logging.warning(
+            "use_discrete_base_heads=true requires the current local mixed-action processors. "
+            "Skipping pretrained processors and rebuilding them from the current policy config."
+        )
+        return None
+
+    return str(processor_pretrained_path)
 
 
 def apply_training_dataset_factory_stats(
@@ -286,6 +310,63 @@ def _build_named_action_map(values: list[float], action_names: list[str]) -> dic
     return {name: value for name, value in zip(action_names, values, strict=True)}
 
 
+def _resolve_compared_action_indices(
+    *,
+    policy_config: Any,
+    action_names: list[str],
+    prediction_values: list[float],
+) -> list[int]:
+    if getattr(policy_config, "use_discrete_base_heads", False):
+        compared_indices = list(getattr(policy_config, "base_action_dims", []))
+        if not compared_indices:
+            raise ValueError("Mixed-action policy must define non-empty `base_action_dims`.")
+        if len(set(compared_indices)) != len(compared_indices):
+            raise ValueError(f"Predicted action indices must be unique. Got {compared_indices}.")
+        if any(index < 0 or index >= len(action_names) for index in compared_indices):
+            raise ValueError(
+                f"Predicted action indices {compared_indices} are out of bounds for action schema of size {len(action_names)}."
+            )
+        return compared_indices
+
+    if len(prediction_values) == len(action_names):
+        return list(range(len(action_names)))
+
+    compared_indices = getattr(policy_config, "predicted_action_indices", None)
+    if compared_indices is None:
+        raise ValueError(
+            f"Action vector length {len(prediction_values)} does not match action names length {len(action_names)} "
+            "and no explicit predicted-action mapping was provided."
+        )
+
+    compared_indices = list(compared_indices)
+    if len(compared_indices) != len(prediction_values):
+        raise ValueError(
+            f"Predicted action mapping length {len(compared_indices)} does not match prediction length {len(prediction_values)}."
+        )
+    if len(set(compared_indices)) != len(compared_indices):
+        raise ValueError(f"Predicted action indices must be unique. Got {compared_indices}.")
+    if any(index < 0 or index >= len(action_names) for index in compared_indices):
+        raise ValueError(
+            f"Predicted action indices {compared_indices} are out of bounds for action schema of size {len(action_names)}."
+        )
+    return compared_indices
+
+
+def _select_prediction_values(
+    *,
+    prediction_values: list[float],
+    compared_indices: list[int],
+    action_names: list[str],
+) -> list[float]:
+    if len(prediction_values) == len(action_names):
+        return [prediction_values[index] for index in compared_indices]
+    if len(prediction_values) == len(compared_indices):
+        return prediction_values
+    raise ValueError(
+        f"Cannot align prediction length {len(prediction_values)} with compared action indices {compared_indices}."
+    )
+
+
 def _predict_single_sample(
     *,
     sample: dict[str, Any],
@@ -307,9 +388,27 @@ def _predict_single_sample(
 
     prediction_values = _as_float_list(prediction)
     label_values = _as_float_list(label)
-    prediction_map = _build_named_action_map(prediction_values, action_names)
-    label_map = _build_named_action_map(label_values, action_names)
-    delta_map = {name: float(prediction_map[name] - label_map[name]) for name in action_names}
+    compared_indices = _resolve_compared_action_indices(
+        policy_config=policy.config,
+        action_names=action_names,
+        prediction_values=prediction_values,
+    )
+    compared_action_names = [action_names[index] for index in compared_indices]
+    compared_prediction_values = _select_prediction_values(
+        prediction_values=prediction_values,
+        compared_indices=compared_indices,
+        action_names=action_names,
+    )
+    compared_label_values = [label_values[index] for index in compared_indices]
+    prediction_map = _build_named_action_map(compared_prediction_values, compared_action_names)
+    label_map = _build_named_action_map(compared_label_values, compared_action_names)
+    delta_map = {name: float(prediction_map[name] - label_map[name]) for name in compared_action_names}
+    metadata = {
+        **metadata,
+        "action_names": compared_action_names,
+        "predicted_action_indices": compared_indices,
+        "raw_prediction_dim": len(prediction_values),
+    }
     return metadata, prediction_map, label_map, delta_map
 
 
@@ -420,7 +519,6 @@ def run_inspection(
         "stats_dataset_repo_id": stats_dataset_repo_id or dataset_repo_id,
         "stats_dataset_root": str(stats_dataset_root or dataset_root),
         **metadata,
-        "action_names": action_names,
         "prediction": prediction_map,
         "label": label_map,
         "delta": delta_map,

@@ -483,6 +483,128 @@ def test_run_inspection_builds_prediction_label_and_delta(tmp_path, monkeypatch)
     assert json.loads(comparison_json.read_text()) == result
 
 
+def test_run_inspection_compares_only_smolvla_predicted_action_dims(tmp_path, monkeypatch):
+    module = load_inspect_module()
+
+    class FakeDatasetForMixedAction:
+        def __init__(self, *args, **kwargs):
+            self.meta = type(
+                "Meta",
+                (),
+                {
+                    "episodes": [{"dataset_from_index": 0, "dataset_to_index": 1}],
+                    "stats": {"action": {"mean": torch.zeros(9)}},
+                    "features": {
+                        "action": {
+                            "names": [
+                                "arm_0",
+                                "arm_1",
+                                "arm_2",
+                                "arm_3",
+                                "arm_4",
+                                "arm_5",
+                                "x.vel",
+                                "y.vel",
+                                "theta.vel",
+                            ]
+                        }
+                    },
+                },
+            )()
+            self.num_frames = 1
+
+        def __getitem__(self, idx):
+            assert idx == 0
+            return {
+                "observation.images.front": torch.zeros(3, 4, 5),
+                "observation.images.wrist": torch.ones(3, 4, 5),
+                "observation.state": torch.arange(9, dtype=torch.float32),
+                "action": torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, -0.2, 0.0, 0.3]),
+                "episode_index": torch.tensor(0),
+                "frame_index": torch.tensor(0),
+                "index": torch.tensor(0),
+                "task": "pick banana",
+            }
+
+    class FakePolicy:
+        config = type(
+            "Config",
+            (),
+            {
+                "device": "cpu",
+                "use_amp": False,
+                "use_discrete_base_heads": True,
+                "base_action_dims": [6, 7, 8],
+                "input_features": {
+                    "observation.images.front": object(),
+                    "observation.images.wrist": object(),
+                    "observation.state": object(),
+                },
+            },
+        )()
+
+        def select_action(self, observation):
+            return torch.tensor([[10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 0.1, -0.1, 0.2]])
+
+    monkeypatch.setattr(module, "LeRobotDataset", FakeDatasetForMixedAction)
+    monkeypatch.setattr(
+        module,
+        "load_policy_and_processors",
+        lambda **kwargs: (FakePolicy(), lambda batch: batch, lambda action: action),
+    )
+
+    result = module.run_inspection(
+        policy_path=Path("/tmp/pretrained_model"),
+        dataset_repo_id="lekiwi_pick_and_put_banana",
+        dataset_root=Path("/tmp/dataset"),
+        output_dir=tmp_path,
+        global_index=0,
+    )
+
+    assert result["action_names"] == ["x.vel", "y.vel", "theta.vel"]
+    assert result["predicted_action_indices"] == [6, 7, 8]
+    assert result["raw_prediction_dim"] == 9
+    assert result["prediction"] == pytest.approx({"x.vel": 0.1, "y.vel": -0.1, "theta.vel": 0.2})
+    assert result["label"] == pytest.approx({"x.vel": -0.2, "y.vel": 0.0, "theta.vel": 0.3})
+    assert result["delta"] == pytest.approx({"x.vel": 0.3, "y.vel": -0.1, "theta.vel": -0.1})
+
+
+def test_load_policy_and_processors_disables_pretrained_processors_for_mixed_action(monkeypatch):
+    module = load_inspect_module()
+
+    policy_cfg = type(
+        "Config",
+        (),
+        {
+            "device": "cpu",
+            "pretrained_path": "/tmp/pretrained_model",
+            "use_discrete_base_heads": True,
+        },
+    )()
+    dataset_meta = object()
+    stats_meta = type("StatsMeta", (), {"stats": {"action": {"mean": torch.zeros(9)}}})()
+
+    captured = {}
+
+    monkeypatch.setattr(module.PreTrainedConfig, "from_pretrained", lambda path: policy_cfg)
+    monkeypatch.setattr(module, "make_policy", lambda cfg, ds_meta: type("Policy", (), {"config": cfg})())
+
+    def fake_make_pre_post_processors(**kwargs):
+        captured.update(kwargs)
+        return object(), object()
+
+    monkeypatch.setattr(module, "make_pre_post_processors", fake_make_pre_post_processors)
+
+    module.load_policy_and_processors(
+        policy_path=Path("/tmp/pretrained_model"),
+        dataset_meta=dataset_meta,
+        stats_meta=stats_meta,
+        device=None,
+    )
+
+    assert captured["pretrained_path"] is None
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
