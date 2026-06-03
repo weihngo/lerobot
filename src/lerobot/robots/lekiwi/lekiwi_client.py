@@ -326,10 +326,17 @@ class LeKiwiClient(Robot):
         return action_sent
 
     @check_if_not_connected
+    def stop_base(self):
+        self.zmq_cmd_socket.send_string(json.dumps({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}))
+
+    @check_if_not_connected
     def disconnect(self):
         """Cleans ZMQ comms"""
 
-        self.zmq_observation_socket.close()
-        self.zmq_cmd_socket.close()
-        self.zmq_context.term()
-        self._is_connected = False
+        try:
+            self.stop_base()
+        finally:
+            self.zmq_observation_socket.close()
+            self.zmq_cmd_socket.close()
+            self.zmq_context.term()
+            self._is_connected = False

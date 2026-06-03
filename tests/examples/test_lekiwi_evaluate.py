@@ -164,3 +164,59 @@ def test_load_policy_for_evaluate_uses_policy_type_from_pretrained_config(monkey
     assert captured["path"] == "/tmp/pretrained_model"
     assert isinstance(captured["config"], FakeConfig)
     assert captured["dataset_stats"] is stats
+
+
+def test_build_lekiwi_base_stop_action_zeroes_base_velocities_and_preserves_arm_targets():
+    module = load_evaluate_module()
+
+    stop_action = module.build_lekiwi_base_stop_action(
+        {
+            "arm_shoulder_pan.pos": 12.5,
+            "arm_gripper.pos": 33.0,
+            "x.vel": 0.3,
+            "y.vel": -0.2,
+            "theta.vel": 45.0,
+        }
+    )
+
+    assert stop_action == {
+        "arm_shoulder_pan.pos": 12.5,
+        "arm_gripper.pos": 33.0,
+        "x.vel": 0.0,
+        "y.vel": 0.0,
+        "theta.vel": 0.0,
+    }
+
+
+def test_sanitize_lekiwi_base_action_preserves_fractional_base_velocities():
+    module = load_evaluate_module()
+
+    action = module.sanitize_lekiwi_base_action(
+        {
+            "arm_shoulder_pan.pos": 12.5,
+            "x.vel": 0.25,
+            "y.vel": -0.25,
+            "theta.vel": 0.25,
+        }
+    )
+
+    assert action == {
+        "arm_shoulder_pan.pos": 12.5,
+        "x.vel": 0.25,
+        "y.vel": -0.25,
+        "theta.vel": 0.25,
+    }
+
+
+def test_sanitize_lekiwi_base_action_replaces_non_finite_base_velocities_with_zero():
+    module = load_evaluate_module()
+
+    action = module.sanitize_lekiwi_base_action(
+        {
+            "x.vel": float("nan"),
+            "y.vel": float("inf"),
+            "theta.vel": float("-inf"),
+        }
+    )
+
+    assert action == {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}

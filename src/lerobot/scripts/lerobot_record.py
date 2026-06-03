@@ -72,7 +72,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -306,6 +306,7 @@ def record_loop(
     display_data: bool = False,
     interpolator: ActionInterpolator | None = None,
     display_compressed_images: bool = False,
+    stop_action_builder: Callable[[RobotAction, RobotObservation], RobotAction] | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -354,36 +355,66 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
-    while timestamp < control_time_s:
-        start_loop_t = time.perf_counter()
+    last_robot_action: RobotAction | None = None
+    last_observation: RobotObservation | None = None
+    try:
+        while timestamp < control_time_s:
+            start_loop_t = time.perf_counter()
 
-        if events["exit_early"]:
-            events["exit_early"] = False
-            break
+            if events["exit_early"]:
+                events["exit_early"] = False
+                break
 
-        # Get robot observation
-        if len(policy._action_queue) == 0:
-            time.sleep(0)
-        obs = robot.get_observation()
+            # Get robot observation
+            policy_action_queue = getattr(policy, "_action_queue", None)
+            if policy_action_queue is not None and len(policy_action_queue) == 0:
+                time.sleep(0.5)
+            obs = robot.get_observation()
 
-        # Applies a pipeline to the raw robot observation, default is IdentityProcessor
-        obs_processed = robot_observation_processor(obs)
+            # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+            obs_processed = robot_observation_processor(obs)
 
-        if policy is not None or dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+            if policy is not None or dataset is not None:
+                observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
-        # Track whether this iteration should be recorded to the dataset.
-        # Interpolated-only iterations send actions to the robot but don't record frames,
-        # keeping the dataset at the original fps while the robot moves at the higher rate.
-        is_record_frame = True
+            # Track whether this iteration should be recorded to the dataset.
+            # Interpolated-only iterations send actions to the robot but don't record frames,
+            # keeping the dataset at the original fps while the robot moves at the higher rate.
+            is_record_frame = True
 
-        # Get action from either policy or teleop
-        if policy is not None and preprocessor is not None and postprocessor is not None:
-            # With interpolation: only call policy when interpolator needs new action
-            if use_interpolation:
-                ran_inference = False
+            # Get action from either policy or teleop
+            if policy is not None and preprocessor is not None and postprocessor is not None:
+                # With interpolation: only call policy when interpolator needs new action
+                if use_interpolation:
+                    ran_inference = False
 
-                if interpolator.needs_new_action():
+                    if interpolator.needs_new_action():
+                        action_values = predict_action(
+                            observation=observation_frame,
+                            policy=policy,
+                            device=get_safe_torch_device(policy.config.device),
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            use_amp=policy.config.use_amp,
+                            task=single_task,
+                            robot_type=robot.robot_type,
+                        )
+                        act_processed_policy = make_robot_action(action_values, dataset.features)
+                        robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+
+                        action_tensor = torch.tensor([robot_action_to_send[k] for k in action_keys])
+                        interpolator.add(action_tensor)
+                        ran_inference = True
+
+                    interp_action = interpolator.get()
+                    if interp_action is not None:
+                        robot_action_to_send = {k: interp_action[i].item() for i, k in enumerate(action_keys)}
+                        action_values = robot_action_to_send
+                    else:
+                        continue
+
+                    is_record_frame = ran_inference
+                else:
                     action_values = predict_action(
                         observation=observation_frame,
                         policy=policy,
@@ -394,96 +425,87 @@ def record_loop(
                         task=single_task,
                         robot_type=robot.robot_type,
                     )
-                    act_processed_policy = make_robot_action(action_values, dataset.features)
+                    act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+                    # Applies a pipeline to the action, default is IdentityProcessor
                     robot_action_to_send = robot_action_processor((act_processed_policy, obs))
-
-                    action_tensor = torch.tensor([robot_action_to_send[k] for k in action_keys])
-                    interpolator.add(action_tensor)
-                    ran_inference = True
-
-                interp_action = interpolator.get()
-                if interp_action is not None:
-                    robot_action_to_send = {k: interp_action[i].item() for i, k in enumerate(action_keys)}
                     action_values = robot_action_to_send
-                else:
-                    continue
 
-                is_record_frame = ran_inference
+            elif policy is None and isinstance(teleop, Teleoperator):
+                act = teleop.get_action()
+                if robot.name == "unitree_g1":
+                    teleop.send_feedback(obs)
+
+                # Applies a pipeline to the raw teleop action, default is IdentityProcessor
+                act_processed_teleop = teleop_action_processor((act, obs))
+                action_values = act_processed_teleop
+                robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
+            elif policy is None and isinstance(teleop, list):
+                arm_action = teleop_arm.get_action()
+                arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+                keyboard_action = teleop_keyboard.get_action()
+                base_action = robot._from_keyboard_to_base_action(keyboard_action)
+                act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+                act_processed_teleop = teleop_action_processor((act, obs))
+                action_values = act_processed_teleop
+                robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
             else:
-                action_values = predict_action(
-                    observation=observation_frame,
-                    policy=policy,
-                    device=get_safe_torch_device(policy.config.device),
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    use_amp=policy.config.use_amp,
-                    task=single_task,
-                    robot_type=robot.robot_type,
+                no_action_count += 1
+                if no_action_count == 1 or no_action_count % 10 == 0:
+                    logging.warning(
+                        "No policy or teleoperator provided, skipping action generation. "
+                        "This is likely to happen when resetting the environment without a teleop device. "
+                        "The robot won't be at its rest position at the start of the next episode."
+                    )
+                continue
+
+            # print(f"action_values: {action_values}")
+            print(f"Action to send: {robot_action_to_send}")
+            # Send action to robot
+            # Action can eventually be clipped using `max_relative_target`,
+            # so action actually sent is saved in the dataset. action = postprocessor.process(action)
+            # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+            _sent_action = robot.send_action(robot_action_to_send)
+            last_robot_action = robot_action_to_send
+            last_observation = obs
+
+            policy_chunk_finished = (
+                stop_action_builder is not None
+                and policy_action_queue is not None
+                and len(policy_action_queue) == 0
+                and (not use_interpolation or interpolator.needs_new_action())
+            )
+            if policy_chunk_finished:
+                stop_action = stop_action_builder(last_robot_action, obs)
+                robot.send_action(stop_action)
+                last_robot_action = stop_action
+
+            # Write to dataset (only on real policy frames, not interpolated-only iterations)
+            if dataset is not None and is_record_frame:
+                action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+                frame = {**observation_frame, **action_frame, "task": single_task}
+                dataset.add_frame(frame)
+
+            if display_data:
+                log_rerun_data(
+                    observation=obs_processed, action=action_values, compress_images=display_compressed_images
                 )
-                act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
-                # Applies a pipeline to the action, default is IdentityProcessor
-                robot_action_to_send = robot_action_processor((act_processed_policy, obs))
-                action_values = robot_action_to_send
 
-        elif policy is None and isinstance(teleop, Teleoperator):
-            act = teleop.get_action()
-            if robot.name == "unitree_g1":
-                teleop.send_feedback(obs)
+            dt_s = time.perf_counter() - start_loop_t
 
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
-            act_processed_teleop = teleop_action_processor((act, obs))
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-
-        elif policy is None and isinstance(teleop, list):
-            arm_action = teleop_arm.get_action()
-            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
-            keyboard_action = teleop_keyboard.get_action()
-            base_action = robot._from_keyboard_to_base_action(keyboard_action)
-            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
-            act_processed_teleop = teleop_action_processor((act, obs))
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-        else:
-            no_action_count += 1
-            if no_action_count == 1 or no_action_count % 10 == 0:
+            sleep_time_s: float = control_interval - dt_s
+            if sleep_time_s < 0:
                 logging.warning(
-                    "No policy or teleoperator provided, skipping action generation. "
-                    "This is likely to happen when resetting the environment without a teleop device. "
-                    "The robot won't be at its rest position at the start of the next episode."
+                    f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
                 )
-            continue
 
-        print(f"action_values: {action_values}")
-        print(f"Action to send: {robot_action_to_send}")
-        # Send action to robot
-        # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
-        _sent_action = robot.send_action(robot_action_to_send)
+            precise_sleep(max(sleep_time_s, 0.0))
 
-        # Write to dataset (only on real policy frames, not interpolated-only iterations)
-        if dataset is not None and is_record_frame:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-            frame = {**observation_frame, **action_frame, "task": single_task}
-            dataset.add_frame(frame)
-
-        if display_data:
-            log_rerun_data(
-                observation=obs_processed, action=action_values, compress_images=display_compressed_images
-            )
-
-        dt_s = time.perf_counter() - start_loop_t
-
-        sleep_time_s: float = control_interval - dt_s
-        if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
-
-        precise_sleep(max(sleep_time_s, 0.0))
-
-        timestamp = time.perf_counter() - start_episode_t
+            timestamp = time.perf_counter() - start_episode_t
+    finally:
+        if stop_action_builder is not None and last_robot_action is not None and last_observation is not None:
+            stop_action = stop_action_builder(last_robot_action, last_observation)
+            robot.send_action(stop_action)
 
 
 @parser.wrap()
