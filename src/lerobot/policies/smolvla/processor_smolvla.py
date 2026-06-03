@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import torch
@@ -32,13 +32,30 @@ from lerobot.processor import (
     ProcessorStepRegistry,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
-    UnnormalizerProcessorStep,
     TransitionKey,
+    UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
-from lerobot.utils.constants import OBS_STATE, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import (
+    OBS_STATE,
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
 SMOLVLA_ARM_STATE_KEY = "smolvla.arm_passthrough_state"
+
+
+def _coerce_action_heads(
+    action_heads: list[SmolVLAActionHeadConfig | dict[str, Any]],
+) -> list[SmolVLAActionHeadConfig]:
+    return [
+        head if isinstance(head, SmolVLAActionHeadConfig) else SmolVLAActionHeadConfig(**head)
+        for head in action_heads
+    ]
+
+
+def _serialize_action_heads(action_heads: list[SmolVLAActionHeadConfig]) -> list[dict[str, Any]]:
+    return [asdict(head) for head in action_heads]
 
 
 def make_smolvla_pre_post_processors(
@@ -178,6 +195,9 @@ class ExtractDiscreteBaseTargetsProcessorStep(ProcessorStep):
     action_heads: list[SmolVLAActionHeadConfig]
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        self.action_heads = _coerce_action_heads(self.action_heads)
+
     def __call__(self, transition):
         new_transition = dict(transition)
         observation = new_transition.get(TransitionKey.OBSERVATION) or {}
@@ -206,6 +226,9 @@ class ExtractDiscreteBaseTargetsProcessorStep(ProcessorStep):
     def transform_features(self, features):
         return features
 
+    def get_config(self) -> dict[str, Any]:
+        return {"action_heads": _serialize_action_heads(self.action_heads)}
+
 
 @dataclass
 @ProcessorStepRegistry.register(name="assemble_lekiwi_passthrough_action")
@@ -215,6 +238,9 @@ class AssembleLeKiwiPassthroughActionProcessorStep(ProcessorStep):
     export_action_dim: int
     action_heads: list[SmolVLAActionHeadConfig]
     extract_step: ExtractDiscreteBaseTargetsProcessorStep | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.action_heads = _coerce_action_heads(self.action_heads)
 
     def __call__(self, transition):
         head_outputs = transition[TransitionKey.ACTION]
@@ -239,7 +265,9 @@ class AssembleLeKiwiPassthroughActionProcessorStep(ProcessorStep):
         passthrough = state[..., self.arm_passthrough_dims]
         while passthrough.ndim < action.ndim:
             passthrough = passthrough.unsqueeze(-2)
-        action[..., self.arm_passthrough_dims] = passthrough.expand(*prefix_shape, len(self.arm_passthrough_dims))
+        action[..., self.arm_passthrough_dims] = passthrough.expand(
+            *prefix_shape, len(self.arm_passthrough_dims)
+        )
         for head in self.action_heads:
             logits = head_outputs[f"{head.name}_logits"]
             class_id = torch.argmax(logits, dim=-1)
@@ -251,3 +279,11 @@ class AssembleLeKiwiPassthroughActionProcessorStep(ProcessorStep):
 
     def transform_features(self, features):
         return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "arm_passthrough_dims": self.arm_passthrough_dims,
+            "base_action_dims": self.base_action_dims,
+            "export_action_dim": self.export_action_dim,
+            "action_heads": _serialize_action_heads(self.action_heads),
+        }

@@ -1,4 +1,6 @@
+# ruff: noqa: E402, I001
 import importlib
+import json
 import sys
 from pathlib import Path
 
@@ -15,20 +17,28 @@ for m in list(sys.modules):
         del sys.modules[m]
 importlib.invalidate_caches()
 
-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAActionHeadConfig
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAActionHeadConfig, SmolVLAConfig
 from lerobot.policies.smolvla.processor_smolvla import (
     AssembleLeKiwiPassthroughActionProcessorStep,
     ExtractDiscreteBaseTargetsProcessorStep,
     SMOLVLA_ARM_STATE_KEY,
     SmolVLANewLineProcessor,
 )
-from lerobot.processor import ProcessorStepRegistry, TransitionKey
+from lerobot.processor import NormalizerProcessorStep, ProcessorStepRegistry, TransitionKey
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 
 def test_smolvla_mixed_action_processors_remain_registered():
     assert ProcessorStepRegistry.get("smolvla_new_line_processor") is SmolVLANewLineProcessor
-    assert ProcessorStepRegistry.get("extract_discrete_base_targets") is ExtractDiscreteBaseTargetsProcessorStep
-    assert ProcessorStepRegistry.get("assemble_lekiwi_passthrough_action") is AssembleLeKiwiPassthroughActionProcessorStep
+    assert (
+        ProcessorStepRegistry.get("extract_discrete_base_targets") is ExtractDiscreteBaseTargetsProcessorStep
+    )
+    assert (
+        ProcessorStepRegistry.get("assemble_lekiwi_passthrough_action")
+        is AssembleLeKiwiPassthroughActionProcessorStep
+    )
 
 
 def test_extract_discrete_base_targets_maps_three_classes_and_caches_raw_state():
@@ -101,3 +111,69 @@ def test_assemble_passthrough_action_restores_nine_dims_from_cached_state():
             ]
         ),
     )
+
+
+def test_make_pre_post_processors_loads_legacy_empty_smolvla_discrete_base_configs(tmp_path):
+    config = SmolVLAConfig(
+        use_discrete_base_heads=True,
+        arm_passthrough_dims=[0, 1, 2, 3, 4, 5],
+        export_action_dim=9,
+    )
+    config.input_features = {OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(9,))}
+    config.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(9,))}
+    config.normalization_mapping = {
+        FeatureType.STATE: NormalizationMode.MEAN_STD,
+        FeatureType.ACTION: NormalizationMode.MEAN_STD,
+    }
+    stats = {
+        OBS_STATE: {"mean": torch.zeros(9), "std": torch.ones(9)},
+        ACTION: {"mean": torch.zeros(9), "std": torch.ones(9)},
+    }
+
+    features = {
+        OBS_STATE: {"type": "STATE", "shape": [9]},
+        ACTION: {"type": "ACTION", "shape": [9]},
+    }
+    norm_map = {"STATE": "MEAN_STD", "ACTION": "MEAN_STD"}
+    (tmp_path / "policy_preprocessor.json").write_text(
+        json.dumps(
+            {
+                "name": "policy_preprocessor",
+                "steps": [
+                    {"registry_name": "extract_discrete_base_targets", "config": {}},
+                    {
+                        "registry_name": "normalizer_processor",
+                        "config": {"features": features, "norm_map": norm_map},
+                    },
+                ],
+            }
+        )
+    )
+    (tmp_path / "policy_postprocessor.json").write_text(
+        json.dumps(
+            {
+                "name": "policy_postprocessor",
+                "steps": [
+                    {"registry_name": "assemble_lekiwi_passthrough_action", "config": {}},
+                ],
+            }
+        )
+    )
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        config,
+        pretrained_path=tmp_path,
+        dataset_stats=stats,
+    )
+
+    extract_step = preprocessor.steps[0]
+    normalizer_step = preprocessor.steps[1]
+    assemble_step = postprocessor.steps[0]
+
+    assert isinstance(extract_step, ExtractDiscreteBaseTargetsProcessorStep)
+    assert isinstance(normalizer_step, NormalizerProcessorStep)
+    assert isinstance(assemble_step, AssembleLeKiwiPassthroughActionProcessorStep)
+    assert assemble_step.extract_step is extract_step
+    assert [head.name for head in extract_step.action_heads] == ["base_x", "base_y", "base_theta"]
+    assert assemble_step.arm_passthrough_dims == [0, 1, 2, 3, 4, 5]
+    assert assemble_step.base_action_dims == [6, 7, 8]

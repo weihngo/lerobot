@@ -82,6 +82,26 @@ def _reconnect_relative_absolute_steps(
             step.relative_step = relative_step
 
 
+def _reconnect_smolvla_discrete_base_steps(
+    preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
+) -> None:
+    """Wire SmolVLA mixed-action postprocessor to its preprocessor state cache after deserialization."""
+    from lerobot.policies.smolvla.processor_smolvla import (
+        AssembleLeKiwiPassthroughActionProcessorStep,
+        ExtractDiscreteBaseTargetsProcessorStep,
+    )
+
+    extract_step = next(
+        (s for s in preprocessor.steps if isinstance(s, ExtractDiscreteBaseTargetsProcessorStep)), None
+    )
+    if extract_step is None:
+        return
+
+    for step in postprocessor.steps:
+        if isinstance(step, AssembleLeKiwiPassthroughActionProcessorStep) and step.extract_step is None:
+            step.extract_step = extract_step
+
+
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     """
     Retrieves a policy class by its registered name.
@@ -303,6 +323,21 @@ def make_pre_post_processors(
                 dataset_stats=dataset_stats,
             )
 
+        if isinstance(policy_cfg, SmolVLAConfig) and policy_cfg.use_discrete_base_heads:
+            extract_overrides = dict(preprocessor_overrides.get("extract_discrete_base_targets", {}))
+            extract_overrides.setdefault("action_heads", policy_cfg.action_heads)
+            preprocessor_overrides["extract_discrete_base_targets"] = extract_overrides
+
+            assemble_overrides = dict(postprocessor_overrides.get("assemble_lekiwi_passthrough_action", {}))
+            assemble_overrides.setdefault("arm_passthrough_dims", policy_cfg.arm_passthrough_dims)
+            assemble_overrides.setdefault("base_action_dims", policy_cfg.base_action_dims)
+            assemble_overrides.setdefault("export_action_dim", policy_cfg.export_action_dim)
+            assemble_overrides.setdefault("action_heads", policy_cfg.action_heads)
+            postprocessor_overrides["assemble_lekiwi_passthrough_action"] = assemble_overrides
+
+            # Discrete-base SmolVLA assembles raw LeKiwi actions directly instead of unnormalizing tensors.
+            postprocessor_overrides.pop("unnormalizer_processor", None)
+
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
@@ -341,6 +376,7 @@ def make_pre_post_processors(
             to_output=transition_to_policy_action,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        _reconnect_smolvla_discrete_base_steps(preprocessor, postprocessor)
         return preprocessor, postprocessor
 
     # Create a new processor based on policy type
