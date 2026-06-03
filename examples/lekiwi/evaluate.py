@@ -20,13 +20,12 @@ from pathlib import Path
 
 import torch
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.factory import IMAGENET_STATS
 from lerobot.datasets.feature_utils import hw_to_dataset_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies.act.modeling_act import ACTPolicy
-from lerobot.policies.pi05.modeling_pi05 import PI05Policy
-from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.processor import make_default_processors
 from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig
 from lerobot.scripts.lerobot_record import record_loop
@@ -90,7 +89,9 @@ def resolve_policy_stats(
 
 
 def load_policy_for_evaluate(*, pretrained_path: str | Path, dataset_stats):
-    return ACTPolicy.from_pretrained(pretrained_path, dataset_stats=dataset_stats)
+    config = PreTrainedConfig.from_pretrained(pretrained_path)
+    policy_class = get_policy_class(config.type)
+    return policy_class.from_pretrained(pretrained_path, config=config, dataset_stats=dataset_stats)
 
 
 def main():
@@ -128,7 +129,7 @@ def main():
 
     # Build Policy Processors
     preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=policy,
+        policy_cfg=policy.config,
         pretrained_path=HF_MODEL_ID,
         dataset_stats=policy_stats,
         # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.

@@ -126,19 +126,31 @@ def test_append_control_log_writes_one_line_per_action(tmp_path):
     assert "theta.vel=30.0" in lines[0]
 
 
-def test_load_policy_for_evaluate_passes_dataset_stats_to_act_policy(monkeypatch):
+def test_load_policy_for_evaluate_uses_policy_type_from_pretrained_config(monkeypatch):
     module = load_evaluate_module()
     captured = {}
 
+    class FakeConfig:
+        type = "smolvla"
+
     class FakePolicy:
-        pass
+        @classmethod
+        def from_pretrained(cls, path, *, config=None, dataset_stats=None):
+            captured["path"] = path
+            captured["config"] = config
+            captured["dataset_stats"] = dataset_stats
+            return cls()
 
-    def fake_from_pretrained(path, dataset_stats=None):
-        captured["path"] = path
-        captured["dataset_stats"] = dataset_stats
-        return FakePolicy()
+    def fake_config_from_pretrained(path):
+        captured["config_path"] = path
+        return FakeConfig()
 
-    monkeypatch.setattr(module.ACTPolicy, "from_pretrained", fake_from_pretrained)
+    def fake_get_policy_class(policy_type):
+        captured["policy_type"] = policy_type
+        return FakePolicy
+
+    monkeypatch.setattr(module.PreTrainedConfig, "from_pretrained", fake_config_from_pretrained)
+    monkeypatch.setattr(module, "get_policy_class", fake_get_policy_class)
 
     stats = {"action": {"mean": "train"}}
     policy = module.load_policy_for_evaluate(
@@ -147,5 +159,8 @@ def test_load_policy_for_evaluate_passes_dataset_stats_to_act_policy(monkeypatch
     )
 
     assert isinstance(policy, FakePolicy)
+    assert captured["config_path"] == "/tmp/pretrained_model"
+    assert captured["policy_type"] == "smolvla"
     assert captured["path"] == "/tmp/pretrained_model"
+    assert isinstance(captured["config"], FakeConfig)
     assert captured["dataset_stats"] is stats
