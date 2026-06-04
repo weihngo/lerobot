@@ -40,6 +40,7 @@ NUM_EPISODES = 2
 FPS = 30
 EPISODE_TIME_SEC = 180
 TASK_DESCRIPTION = "pick and put banana"
+TASK_DESCRIPTION_FILE = Path("/tmp/lekiwi_task.txt")
 HF_MODEL_ID = "/home/lwh/code/lerobot/outputs_hdd/find_and_walk_banana_gap10/checkpoints/last/pretrained_model"
 HF_DATASET_ID = "lwh/pi05"
 TRAIN_STATS_DATASET_ID: str | None = None
@@ -70,6 +71,45 @@ def append_control_log(log_path: Path, action: dict[str, float]) -> None:
     action_str = " ".join(f"{key}={value}" for key, value in sorted(action.items()))
     with log_path.open("a", encoding="utf-8") as log_file:
         log_file.write(f"{timestamp} {action_str}\n")
+
+
+class FileTaskProvider:
+    def __init__(self, path: str | Path, *, default_task: str):
+        self.path = Path(path)
+        self._task = default_task.strip()
+        if not self._task:
+            raise ValueError("default_task must not be empty")
+        self._mtime_ns: int | None = None
+        self._ensure_file()
+        self._refresh(force=True)
+
+    def __call__(self) -> str:
+        self._refresh()
+        return self._task
+
+    def _ensure_file(self) -> None:
+        if self.path.exists():
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(f"{self._task}\n", encoding="utf-8")
+
+    def _refresh(self, *, force: bool = False) -> None:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            self._ensure_file()
+            stat = self.path.stat()
+
+        if not force and stat.st_mtime_ns == self._mtime_ns:
+            return
+
+        self._mtime_ns = stat.st_mtime_ns
+        task = self.path.read_text(encoding="utf-8").strip()
+        if not task:
+            return
+        if task != self._task:
+            print(f"Task description updated: {task}")
+        self._task = task
 
 
 def resolve_policy_stats(
@@ -176,6 +216,8 @@ def main():
     # Initialize the keyboard listener and rerun visualization
     listener, events = init_keyboard_listener()
     init_rerun(session_name="lekiwi_evaluate")
+    task_provider = FileTaskProvider(TASK_DESCRIPTION_FILE, default_task=TASK_DESCRIPTION)
+    print(f"Task description file: {TASK_DESCRIPTION_FILE}")
 
     try:
         if not robot.is_connected:
@@ -197,6 +239,7 @@ def main():
                 dataset=dataset,
                 control_time_s=EPISODE_TIME_SEC,
                 single_task=TASK_DESCRIPTION,
+                task_provider=task_provider,
                 display_data=True,
                 teleop_action_processor=teleop_action_processor,
                 robot_action_processor=robot_action_processor,
@@ -215,6 +258,7 @@ def main():
                     fps=FPS,
                     control_time_s=EPISODE_TIME_SEC,
                     single_task=TASK_DESCRIPTION,
+                    task_provider=task_provider,
                     display_data=True,
                     teleop_action_processor=teleop_action_processor,
                     robot_action_processor=robot_action_processor,

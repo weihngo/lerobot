@@ -69,10 +69,11 @@ lerobot-record \
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -303,6 +304,7 @@ def record_loop(
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
+    task_provider: Callable[[], str | None] | None = None,
     display_data: bool = False,
     interpolator: ActionInterpolator | None = None,
     display_compressed_images: bool = False,
@@ -357,6 +359,7 @@ def record_loop(
     start_episode_t = time.perf_counter()
     last_robot_action: RobotAction | None = None
     last_observation: RobotObservation | None = None
+    last_task: str | None = None
     try:
         while timestamp < control_time_s:
             start_loop_t = time.perf_counter()
@@ -364,6 +367,21 @@ def record_loop(
             if events["exit_early"]:
                 events["exit_early"] = False
                 break
+
+            current_task = task_provider() if task_provider is not None else single_task
+            current_task = current_task or single_task
+            if last_task is None:
+                last_task = current_task
+            elif current_task != last_task:
+                if policy is not None:
+                    policy.reset()
+                if preprocessor is not None:
+                    preprocessor.reset()
+                if postprocessor is not None:
+                    postprocessor.reset()
+                if interpolator is not None:
+                    interpolator.reset()
+                last_task = current_task
 
             # Get robot observation
             policy_action_queue = getattr(policy, "_action_queue", None)
@@ -396,7 +414,7 @@ def record_loop(
                             preprocessor=preprocessor,
                             postprocessor=postprocessor,
                             use_amp=policy.config.use_amp,
-                            task=single_task,
+                            task=current_task,
                             robot_type=robot.robot_type,
                         )
                         act_processed_policy = make_robot_action(action_values, dataset.features)
@@ -422,7 +440,7 @@ def record_loop(
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
                         use_amp=policy.config.use_amp,
-                        task=single_task,
+                        task=current_task,
                         robot_type=robot.robot_type,
                     )
                     act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
@@ -483,7 +501,7 @@ def record_loop(
             # Write to dataset (only on real policy frames, not interpolated-only iterations)
             if dataset is not None and is_record_frame:
                 action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-                frame = {**observation_frame, **action_frame, "task": single_task}
+                frame = {**observation_frame, **action_frame, "task": current_task}
                 dataset.add_frame(frame)
 
             if display_data:
