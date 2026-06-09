@@ -14,6 +14,7 @@
 import abc
 import builtins
 import dataclasses
+import inspect
 import logging
 import os
 from importlib.resources import files
@@ -32,9 +33,21 @@ from torch import Tensor, nn
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.utils import log_model_loading_keys
-from lerobot.utils.hub import HubMixin
+from lerobot.utils.hub import HubMixin, is_local_path
 
 T = TypeVar("T", bound="PreTrainedPolicy")
+
+
+def _accepts_init_kwarg(cls: builtins.type[nn.Module], keyword: str) -> bool:
+    signature = inspect.signature(cls.__init__)
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == keyword and parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+            return True
+        if parameter.name == keyword and parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD:
+            return True
+    return False
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -104,11 +117,17 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 **kwargs,
             )
         model_id = str(pretrained_name_or_path)
-        instance = cls(config, **kwargs)
-        if os.path.isdir(model_id):
+        init_kwargs = dict(kwargs)
+        if _accepts_init_kwarg(cls, "local_files_only"):
+            init_kwargs["local_files_only"] = local_files_only
+        instance = cls(config, **init_kwargs)
+        model_path = Path(model_id).expanduser()
+        if model_path.is_dir():
             print("Loading weights from local directory")
-            model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
+            model_file = os.path.join(model_path, SAFETENSORS_SINGLE_FILE)
             policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
+        elif is_local_path(pretrained_name_or_path):
+            raise FileNotFoundError(f"Local pretrained model path does not exist: {model_path}")
         else:
             try:
                 model_file = hf_hub_download(

@@ -23,6 +23,17 @@ from huggingface_hub.utils import validate_hf_hub_args
 T = TypeVar("T", bound="HubMixin")
 
 
+def is_local_path(path_or_repo_id: str | Path) -> bool:
+    path = str(path_or_repo_id).replace("\\", "/")
+    if path.startswith(("./", "../", "~/")):
+        return True
+    if Path(path_or_repo_id).expanduser().is_absolute():
+        return True
+
+    # Hub repo IDs are only "repo_name" or "namespace/repo_name"; anything deeper is a local path.
+    return len([part for part in path.split("/") if part and part != "."]) > 2
+
+
 class HubMixin:
     """
     A Mixin containing the functionality to push an object to the hub.
