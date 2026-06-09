@@ -3,6 +3,7 @@ import importlib
 import json
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -26,8 +27,27 @@ from lerobot.policies.smolvla.processor_smolvla import (
     SMOLVLA_ARM_STATE_KEY,
     SmolVLANewLineProcessor,
 )
-from lerobot.processor import NormalizerProcessorStep, ProcessorStepRegistry, TransitionKey
+from lerobot.processor import (
+    DeviceProcessorStep,
+    EnvTransition,
+    NormalizerProcessorStep,
+    ProcessorStep,
+    ProcessorStepRegistry,
+    TransitionKey,
+    UnnormalizerProcessorStep,
+)
 from lerobot.utils.constants import ACTION, OBS_STATE
+
+
+class MockTokenizerProcessorStep(ProcessorStep):
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        return transition
+
+    def transform_features(self, features):
+        return features
 
 
 def test_smolvla_mixed_action_processors_remain_registered():
@@ -63,6 +83,27 @@ def test_extract_discrete_base_targets_maps_three_classes_and_caches_raw_state()
     assert torch.equal(out[TransitionKey.COMPLEMENTARY_DATA]["base_theta_target"], torch.tensor(1))
     assert torch.equal(out[TransitionKey.COMPLEMENTARY_DATA][SMOLVLA_ARM_STATE_KEY], state)
     assert torch.equal(step._last_state, state)
+
+
+def test_extract_discrete_base_targets_maps_hybrid_lekiwi_values():
+    step = ExtractDiscreteBaseTargetsProcessorStep(
+        action_heads=[
+            SmolVLAActionHeadConfig("base_x", "categorical", 6, [0.0, 0.1]),
+            SmolVLAActionHeadConfig("base_y", "categorical", 7, [0.0]),
+            SmolVLAActionHeadConfig("base_theta", "categorical", 8, [0.0, 30.0]),
+        ]
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {"observation.state": torch.zeros(9)},
+        TransitionKey.ACTION: torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 30.0]),
+        TransitionKey.COMPLEMENTARY_DATA: {},
+    }
+
+    out = step(transition)
+
+    assert torch.equal(out[TransitionKey.COMPLEMENTARY_DATA]["base_x_target"], torch.tensor(1))
+    assert torch.equal(out[TransitionKey.COMPLEMENTARY_DATA]["base_y_target"], torch.tensor(0))
+    assert torch.equal(out[TransitionKey.COMPLEMENTARY_DATA]["base_theta_target"], torch.tensor(1))
 
 
 def test_assemble_passthrough_action_restores_nine_dims_from_cached_state():
@@ -177,3 +218,113 @@ def test_make_pre_post_processors_loads_legacy_empty_smolvla_discrete_base_confi
     assert [head.name for head in extract_step.action_heads] == ["base_x", "base_y", "base_theta"]
     assert assemble_step.arm_passthrough_dims == [0, 1, 2, 3, 4, 5]
     assert assemble_step.base_action_dims == [6, 7, 8]
+
+
+def test_make_pre_post_processors_rebuilds_legacy_saved_smolvla_discrete_base_configs(tmp_path):
+    config = SmolVLAConfig(
+        use_discrete_base_heads=True,
+        arm_passthrough_dims=[0, 1, 2, 3, 4, 5],
+        export_action_dim=9,
+    )
+    config.input_features = {OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(9,))}
+    config.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(9,))}
+    config.normalization_mapping = {
+        FeatureType.STATE: NormalizationMode.MEAN_STD,
+        FeatureType.ACTION: NormalizationMode.MEAN_STD,
+    }
+    stats = {
+        OBS_STATE: {"mean": torch.zeros(9), "std": torch.ones(9)},
+        ACTION: {"mean": torch.zeros(9), "std": torch.ones(9)},
+    }
+
+    features = {
+        OBS_STATE: {"type": "STATE", "shape": [9]},
+        ACTION: {"type": "ACTION", "shape": [9]},
+    }
+    norm_map = {"STATE": "MEAN_STD", "ACTION": "MEAN_STD"}
+    (tmp_path / "policy_preprocessor.json").write_text(
+        json.dumps(
+            {
+                "name": "policy_preprocessor",
+                "steps": [
+                    {"registry_name": "rename_observations_processor", "config": {"rename_map": {}}},
+                    {"registry_name": "to_batch_processor", "config": {}},
+                    {"registry_name": "smolvla_new_line_processor", "config": {}},
+                    {
+                        "registry_name": "tokenizer_processor",
+                        "config": {"tokenizer_name": config.vlm_model_name},
+                    },
+                    {"registry_name": "device_processor", "config": {"device": "cuda"}},
+                    {
+                        "registry_name": "normalizer_processor",
+                        "config": {"features": features, "norm_map": norm_map},
+                    },
+                ],
+            }
+        )
+    )
+    (tmp_path / "policy_postprocessor.json").write_text(
+        json.dumps(
+            {
+                "name": "policy_postprocessor",
+                "steps": [
+                    {
+                        "registry_name": "unnormalizer_processor",
+                        "config": {"features": {ACTION: features[ACTION]}, "norm_map": norm_map},
+                    },
+                    {"registry_name": "device_processor", "config": {"device": "cpu"}},
+                ],
+            }
+        )
+    )
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_pre_post_processors(
+            config,
+            pretrained_path=tmp_path,
+            dataset_stats=stats,
+            preprocessor_overrides={"device_processor": {"device": "cpu"}},
+        )
+
+    extract_step = next(
+        step for step in preprocessor.steps if isinstance(step, ExtractDiscreteBaseTargetsProcessorStep)
+    )
+    assemble_step = next(
+        step for step in postprocessor.steps if isinstance(step, AssembleLeKiwiPassthroughActionProcessorStep)
+    )
+
+    assert assemble_step.extract_step is extract_step
+    assert [head.name for head in extract_step.action_heads] == ["base_x", "base_y", "base_theta"]
+    assert any(
+        isinstance(step, DeviceProcessorStep) and step.device == "cpu" for step in preprocessor.steps
+    )
+    assert all(not isinstance(step, UnnormalizerProcessorStep) for step in postprocessor.steps)
+
+
+def test_make_smolvla_hybrid_processors_use_hybrid_heads_without_passthrough():
+    config = SmolVLAConfig(use_hybrid_action_heads=True)
+    config.input_features = {OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(9,))}
+    config.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(9,))}
+    config.normalization_mapping = {
+        FeatureType.STATE: NormalizationMode.MEAN_STD,
+        FeatureType.ACTION: NormalizationMode.MEAN_STD,
+    }
+    stats = {
+        OBS_STATE: {"mean": torch.zeros(9), "std": torch.ones(9)},
+        ACTION: {"mean": torch.zeros(9), "std": torch.ones(9)},
+    }
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_pre_post_processors(config, dataset_stats=stats)
+
+    extract_steps = [step for step in preprocessor.steps if isinstance(step, ExtractDiscreteBaseTargetsProcessorStep)]
+    assert len(extract_steps) == 1
+    assert [head.values for head in extract_steps[0].action_heads] == [[0.0, 0.1], [0.0], [0.0, 30.0]]
+    assert any(isinstance(step, NormalizerProcessorStep) for step in preprocessor.steps)
+    assert all(not isinstance(step, AssembleLeKiwiPassthroughActionProcessorStep) for step in postprocessor.steps)
+    assert all(not isinstance(step, UnnormalizerProcessorStep) for step in postprocessor.steps)
+    assert any(isinstance(step, DeviceProcessorStep) for step in postprocessor.steps)

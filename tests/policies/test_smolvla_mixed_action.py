@@ -146,6 +146,52 @@ def test_smolvla_mixed_action_save_load_roundtrip(tmp_path):
     assert [h.name for h in loaded.action_heads] == [h.name for h in cfg.action_heads]
 
 
+def test_smolvla_hybrid_action_defaults_preserve_legacy_mixed_heads():
+    config = SmolVLAConfig(use_hybrid_action_heads=True)
+
+    assert config.hybrid_arm_action_dims == [0, 1, 2, 3, 4, 5]
+    assert config.base_action_dims == [6, 7, 8]
+    assert [head.name for head in config.action_heads] == ["base_x", "base_y", "base_theta"]
+    assert config.action_heads[0].values == [-0.25, 0.0, 0.25]
+    assert [head.name for head in config.hybrid_action_heads] == ["base_x", "base_y", "base_theta"]
+    assert config.hybrid_action_heads[0].values == [0.0, 0.1]
+    assert config.hybrid_action_heads[1].values == [0.0]
+    assert config.hybrid_action_heads[2].values == [0.0, 30.0]
+
+
+def test_smolvla_hybrid_action_rejects_legacy_mixed_mode_overlap():
+    try:
+        SmolVLAConfig(use_discrete_base_heads=True, use_hybrid_action_heads=True)
+    except ValueError as exc:
+        assert "mutually exclusive" in str(exc)
+    else:
+        raise AssertionError("Expected hybrid and legacy mixed modes to be mutually exclusive")
+
+
+def test_smolvla_hybrid_action_rejects_overlapping_indices():
+    try:
+        SmolVLAConfig(
+            use_hybrid_action_heads=True,
+            hybrid_arm_action_dims=[0, 1, 2, 3, 4, 6],
+        )
+    except ValueError as exc:
+        assert "overlap" in str(exc).lower()
+    else:
+        raise AssertionError("Expected hybrid overlap validation to fail")
+
+
+def test_smolvla_hybrid_action_save_load_roundtrip(tmp_path):
+    cfg = SmolVLAConfig(use_hybrid_action_heads=True)
+
+    cfg._save_pretrained(tmp_path)
+    loaded = PreTrainedConfig.from_pretrained(tmp_path)
+
+    assert isinstance(loaded, SmolVLAConfig)
+    assert loaded.use_hybrid_action_heads is True
+    assert loaded.hybrid_arm_action_dims == cfg.hybrid_arm_action_dims
+    assert [h.values for h in loaded.hybrid_action_heads] == [h.values for h in cfg.hybrid_action_heads]
+
+
 def test_smolvla_mixed_action_rejects_arm_passthrough_duplicate_values():
     try:
         SmolVLAConfig(

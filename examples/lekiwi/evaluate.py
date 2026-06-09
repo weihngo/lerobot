@@ -1,4 +1,5 @@
 # !/usr/bin/env python
+# ruff: noqa: E402
 
 # Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 #
@@ -13,6 +14,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import os
+
+# Must be set before importing LeRobot modules that import Transformers/Hugging Face Hub.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import math
 from copy import deepcopy
@@ -36,18 +43,19 @@ from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import init_rerun
 
 LEKIWI_BASE_ACTION_KEYS = ("x.vel", "y.vel", "theta.vel")
+LEKIWI_BASE_ACTION_REMAP = {0.25: 0.1, -0.25: -0.1}
 NUM_EPISODES = 2
 FPS = 30
 EPISODE_TIME_SEC = 180
 TASK_DESCRIPTION = "pick and put banana"
 TASK_DESCRIPTION_FILE = Path("/tmp/lekiwi_task.txt")
-HF_MODEL_ID = "/home/lwh/code/lerobot/outputs_hdd/find_and_walk_banana_gap10/checkpoints/last/pretrained_model"
+HF_MODEL_ID = "/path/to/pretrained_model"
 HF_DATASET_ID = "lwh/pi05"
 TRAIN_STATS_DATASET_ID: str | None = None
 TRAIN_STATS_DATASET_ROOT: Path | None = None
 
 TRAIN_STATS_DATASET_ID = "lekiwi_pick_and_put_banana"
-TRAIN_STATS_DATASET_ROOT = Path("/mnt/data/yzh/dataset/lekiwi_pick_and_put_banana")
+TRAIN_STATS_DATASET_ROOT = Path("/path/to/train_dataset")
 
 
 def resolve_job_name_from_pretrained_path(pretrained_path: str | Path) -> str:
@@ -132,9 +140,14 @@ def resolve_policy_stats(
 
 
 def load_policy_for_evaluate(*, pretrained_path: str | Path, dataset_stats):
-    config = PreTrainedConfig.from_pretrained(pretrained_path)
+    config = PreTrainedConfig.from_pretrained(pretrained_path, local_files_only=True)
     policy_class = get_policy_class(config.type)
-    return policy_class.from_pretrained(pretrained_path, config=config, dataset_stats=dataset_stats)
+    return policy_class.from_pretrained(
+        pretrained_path,
+        config=config,
+        dataset_stats=dataset_stats,
+        local_files_only=True,
+    )
 
 
 def build_lekiwi_base_stop_action(action: dict[str, float]) -> dict[str, float]:
@@ -150,8 +163,18 @@ def sanitize_lekiwi_base_action(action: dict[str, float]) -> dict[str, float]:
     for key in LEKIWI_BASE_ACTION_KEYS:
         if key in sanitized_action:
             value = float(sanitized_action[key])
-            sanitized_action[key] = value if math.isfinite(value) else 0.0
+            sanitized_action[key] = LEKIWI_BASE_ACTION_REMAP.get(value, value) if math.isfinite(value) else 0.0
     return sanitized_action
+
+
+def save_pending_episode(dataset: LeRobotDataset) -> bool:
+    if dataset.has_pending_frames():
+        dataset.save_episode()
+        return True
+
+    print("Skipping save for empty episode buffer.")
+    dataset.clear_episode_buffer()
+    return False
 
 
 def main():
@@ -201,7 +224,9 @@ def main():
     robot.connect()
 
     # TODO(Steven): Update this example to use pipelines
-    teleop_action_processor, base_robot_action_processor, robot_observation_processor = make_default_processors()
+    teleop_action_processor, base_robot_action_processor, robot_observation_processor = (
+        make_default_processors()
+    )
     control_log_path = resolve_control_log_path(HF_MODEL_ID)
 
     def robot_action_processor(action_and_observation):
@@ -274,8 +299,8 @@ def main():
                 continue
 
             # Save episode
-            dataset.save_episode()
-            recorded_episodes += 1
+            if save_pending_episode(dataset):
+                recorded_episodes += 1
 
     finally:
         # Clean up

@@ -386,7 +386,7 @@ def record_loop(
             # Get robot observation
             policy_action_queue = getattr(policy, "_action_queue", None)
             if policy_action_queue is not None and len(policy_action_queue) == 0:
-                time.sleep(0.5)
+                time.sleep(1)
             obs = robot.get_observation()
 
             # Applies a pipeline to the raw robot observation, default is IdentityProcessor

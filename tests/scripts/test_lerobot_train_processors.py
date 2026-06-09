@@ -25,6 +25,13 @@ def test_resolve_processor_pretrained_path_disables_pretrained_processors_for_mi
     assert lerobot_train.resolve_processor_pretrained_path(cfg, resume=False) is None
 
 
+def test_resolve_processor_pretrained_path_disables_pretrained_processors_for_hybrid_action():
+    cfg = SmolVLAConfig(use_hybrid_action_heads=True)
+    cfg.pretrained_path = "lerobot/smolvla_base"
+
+    assert lerobot_train.resolve_processor_pretrained_path(cfg, resume=False) is None
+
+
 def test_resolve_processor_pretrained_path_keeps_pretrained_processors_for_default_smolvla():
     cfg = SmolVLAConfig(use_discrete_base_heads=False)
     cfg.pretrained_path = "lerobot/smolvla_base"

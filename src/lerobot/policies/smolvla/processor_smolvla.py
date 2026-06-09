@@ -101,8 +101,9 @@ def make_smolvla_pre_post_processors(
         ),
     ]
 
-    if config.use_discrete_base_heads:
-        extract_step = ExtractDiscreteBaseTargetsProcessorStep(action_heads=config.action_heads)
+    if config.use_discrete_base_heads or config.use_hybrid_action_heads:
+        action_heads = config.hybrid_action_heads if config.use_hybrid_action_heads else config.action_heads
+        extract_step = ExtractDiscreteBaseTargetsProcessorStep(action_heads=action_heads)
         input_steps.append(extract_step)
 
     input_steps.extend(
@@ -128,7 +129,7 @@ def make_smolvla_pre_post_processors(
                 extract_step=extract_step,
             )
         )
-    else:
+    elif not config.use_hybrid_action_heads:
         output_steps.append(
             UnnormalizerProcessorStep(
                 features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats

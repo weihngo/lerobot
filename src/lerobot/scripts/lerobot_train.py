@@ -102,6 +102,13 @@ def resolve_processor_pretrained_path(policy_cfg, resume: bool) -> str | None:
         )
         return None
 
+    if getattr(policy_cfg, "use_hybrid_action_heads", False):
+        logging.warning(
+            "use_hybrid_action_heads=true requires the current local hybrid-action processors. "
+            "Skipping pretrained processors and rebuilding them from the current policy config."
+        )
+        return None
+
     return processor_pretrained_path
 
 

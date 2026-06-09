@@ -60,6 +60,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
@@ -242,8 +243,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self.dataset_stats = kwargs.get("dataset_stats")
+        self.local_files_only = kwargs.get("local_files_only", False)
         self.init_rtc_processor()
-        self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
+        self.model = VLAFlowMatching(
+            config,
+            rtc_processor=self.rtc_processor,
+            local_files_only=self.local_files_only,
+        )
         self.reset()
 
     def reset(self):
@@ -292,7 +299,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
         )
 
-        if self.config.use_discrete_base_heads:
+        if self.config.use_hybrid_action_heads:
+            actions = self._decode_hybrid_action_chunk(actions)
+        elif self.config.use_discrete_base_heads:
             arm_state = batch.get(SMOLVLA_ARM_STATE_KEY)
             if arm_state is None:
                 raise RuntimeError(
@@ -385,7 +394,27 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
 
-        if getattr(self.config, "use_discrete_base_heads", False):
+        if getattr(self.config, "use_hybrid_action_heads", False):
+            outputs = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+            if "continuous_losses" not in outputs:
+                raise RuntimeError("Hybrid SmolVLA expected continuous_losses in model output")
+            arm_losses = outputs["continuous_losses"][:, :, self.config.hybrid_arm_action_dims]
+            base_losses = self._compute_discrete_head_losses(
+                logits=outputs,
+                batch=batch,
+                loss_dict=loss_dict,
+                action_heads=self.config.hybrid_action_heads,
+            )
+            loss_dict["arm_flow_loss"] = arm_losses.clone().mean().item()
+            loss_dict["base_ce_loss"] = base_losses.clone().mean().item()
+            weighted_losses = []
+            if self.config.hybrid_arm_loss_weight > 0:
+                weighted_losses.append(arm_losses * self.config.hybrid_arm_loss_weight)
+            if self.config.hybrid_base_loss_weight > 0:
+                weighted_losses.append(base_losses * self.config.hybrid_base_loss_weight)
+            losses = torch.cat(weighted_losses, dim=-1)
+            loss_dict["losses_after_forward"] = losses.clone().mean().item()
+        elif getattr(self.config, "use_discrete_base_heads", False):
             logits = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
             losses = self._compute_discrete_head_losses(logits=logits, batch=batch, loss_dict=loss_dict)
             loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -401,7 +430,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             losses = losses * in_episode_bound.unsqueeze(-1)
             loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
 
-        if not getattr(self.config, "use_discrete_base_heads", False):
+        if not getattr(self.config, "use_discrete_base_heads", False) and not getattr(
+            self.config, "use_hybrid_action_heads", False
+        ):
             losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
@@ -417,11 +448,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
             return loss, loss_dict
 
     def _compute_discrete_head_losses(
-        self, logits: dict[str, Tensor], batch: dict[str, Tensor], loss_dict: dict[str, float]
+        self,
+        logits: dict[str, Tensor],
+        batch: dict[str, Tensor],
+        loss_dict: dict[str, float],
+        action_heads=None,
     ) -> Tensor:
+        action_heads = self.config.action_heads if action_heads is None else action_heads
         head_losses = []
         total_weight = 0.0
-        for head in self.config.action_heads:
+        for head in action_heads:
             logits_name = f"{head.name}_logits"
             target_name = f"{head.name}_target"
             if logits_name not in logits:
@@ -469,6 +505,50 @@ class SmolVLAPolicy(PreTrainedPolicy):
             values = actions.new_tensor(head.values)
             actions[..., head.index] = values[class_ids]
         return actions
+
+    def _decode_hybrid_action_chunk(self, outputs: dict[str, Tensor]) -> Tensor:
+        if not isinstance(outputs, dict):
+            raise RuntimeError(f"Hybrid SmolVLA expected dict model output, got {type(outputs)}")
+        if "continuous_actions" not in outputs:
+            raise RuntimeError("Hybrid SmolVLA expected continuous_actions in model output")
+
+        first_logits = outputs[f"{self.config.hybrid_action_heads[0].name}_logits"]
+        prefix_shape = torch.argmax(first_logits, dim=-1).shape
+        continuous_actions = outputs["continuous_actions"]
+        actions = continuous_actions.new_zeros(*prefix_shape, self.config.export_action_dim)
+
+        arm_dims = self.config.hybrid_arm_action_dims
+        normalized_arm_actions = continuous_actions[..., arm_dims]
+        actions[..., arm_dims] = self._unnormalize_action_dims(normalized_arm_actions, arm_dims)
+
+        for head in self.config.hybrid_action_heads:
+            head_logits = outputs[f"{head.name}_logits"]
+            class_ids = torch.argmax(head_logits, dim=-1)
+            values = actions.new_tensor(head.values)
+            actions[..., head.index] = values[class_ids]
+        return actions
+
+    def _unnormalize_action_dims(self, normalized_values: Tensor, dims: list[int]) -> Tensor:
+        norm_mode = self.config.normalization_mapping.get(
+            FeatureType.ACTION, self.config.normalization_mapping.get("ACTION", NormalizationMode.IDENTITY)
+        )
+        if norm_mode == NormalizationMode.IDENTITY or norm_mode == "IDENTITY":
+            return normalized_values
+        if norm_mode != NormalizationMode.MEAN_STD and norm_mode != "MEAN_STD":
+            raise NotImplementedError(
+                f"Hybrid SmolVLA only supports MEAN_STD or IDENTITY action normalization, got {norm_mode}."
+            )
+        if self.dataset_stats is None or ACTION not in self.dataset_stats:
+            raise RuntimeError("Hybrid SmolVLA requires dataset action stats to unnormalize arm actions.")
+
+        action_stats = self.dataset_stats[ACTION]
+        if "mean" not in action_stats or "std" not in action_stats:
+            raise RuntimeError("Hybrid SmolVLA requires action mean/std stats to unnormalize arm actions.")
+
+        mean = torch.as_tensor(action_stats["mean"], dtype=normalized_values.dtype, device=normalized_values.device)
+        std = torch.as_tensor(action_stats["std"], dtype=normalized_values.dtype, device=normalized_values.device)
+        dim_tensor = torch.as_tensor(dims, dtype=torch.long, device=normalized_values.device)
+        return normalized_values * std.index_select(0, dim_tensor) + mean.index_select(0, dim_tensor)
 
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
@@ -622,7 +702,12 @@ class VLAFlowMatching(nn.Module):
     └──────────────────────────────┘
     """
 
-    def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
+    def __init__(
+        self,
+        config: SmolVLAConfig,
+        rtc_processor: RTCProcessor | None = None,
+        local_files_only: bool = False,
+    ):
         super().__init__()
         self.config = config
 
@@ -637,6 +722,7 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            local_files_only=local_files_only,
         )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
@@ -647,6 +733,12 @@ class VLAFlowMatching(nn.Module):
             {
                 head.name: nn.Linear(self.vlm_with_expert.expert_hidden_size, len(head.values))
                 for head in self.config.action_heads
+            }
+        )
+        self.hybrid_discrete_action_heads = nn.ModuleDict(
+            {
+                head.name: nn.Linear(self.vlm_with_expert.expert_hidden_size, len(head.values))
+                for head in self.config.hybrid_action_heads
             }
         )
 
@@ -841,7 +933,27 @@ class VLAFlowMatching(nn.Module):
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if self.config.use_discrete_base_heads:
             return self._forward_discrete_action_heads(images, img_masks, lang_tokens, lang_masks, state, actions)
+        if self.config.use_hybrid_action_heads:
+            outputs = self._forward_discrete_action_heads(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                actions,
+                action_heads=self.config.hybrid_action_heads,
+                action_head_modules=self.hybrid_discrete_action_heads,
+            )
+            outputs["continuous_losses"] = self._forward_continuous_losses(
+                images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+            )
+            return outputs
 
+        return self._forward_continuous_losses(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+
+    def _forward_continuous_losses(
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+    ) -> Tensor:
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -904,7 +1016,45 @@ class VLAFlowMatching(nn.Module):
                     dtype=state.dtype,
                 ),
             )
+        if self.config.use_hybrid_action_heads:
+            if self._rtc_enabled():
+                raise NotImplementedError("RTC is not supported in SmolVLA hybrid-action mode.")
+            continuous_actions = self._sample_continuous_actions(
+                images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            )
+            outputs = self._forward_discrete_action_heads(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                torch.zeros(
+                    state.shape[0],
+                    self.config.chunk_size,
+                    self.config.max_action_dim,
+                    device=state.device,
+                    dtype=state.dtype,
+                ),
+                action_heads=self.config.hybrid_action_heads,
+                action_head_modules=self.hybrid_discrete_action_heads,
+            )
+            outputs["continuous_actions"] = continuous_actions
+            return outputs
 
+        return self._sample_continuous_actions(
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+        )
+
+    def _sample_continuous_actions(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        **kwargs: Unpack[ActionSelectKwargs],
+    ) -> Tensor:
         bsize = state.shape[0]
         device = state.device
 
@@ -1000,7 +1150,19 @@ class VLAFlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         return v_t
 
-    def _forward_discrete_action_heads(self, images, img_masks, lang_tokens, lang_masks, state, actions):
+    def _forward_discrete_action_heads(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        action_heads=None,
+        action_head_modules=None,
+    ):
+        action_heads = self.config.action_heads if action_heads is None else action_heads
+        action_head_modules = self.discrete_action_heads if action_head_modules is None else action_head_modules
         batch_size = state.shape[0]
         if actions.ndim != 3:
             raise RuntimeError(f"Expected actions to have shape (B, T, D) in mixed-action mode, got {actions.shape}")
@@ -1032,6 +1194,6 @@ class VLAFlowMatching(nn.Module):
         )
         suffix_out = suffix_out[:, -actions.shape[1] :].to(dtype=torch.float32)
         return {
-            f"{head.name}_logits": self.discrete_action_heads[head.name](suffix_out)
-            for head in self.config.action_heads
+            f"{head.name}_logits": action_head_modules[head.name](suffix_out)
+            for head in action_heads
         }

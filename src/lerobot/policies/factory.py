@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
+from pathlib import Path
 from typing import Any, TypedDict, Unpack
 
 import torch
@@ -276,6 +278,59 @@ def _merge_processor_stats_overrides(
     return merged_overrides
 
 
+def _get_local_processor_step_keys(pretrained_path: str, config_filename: str) -> set[str] | None:
+    path = Path(pretrained_path).expanduser()
+    if not path.is_dir():
+        return None
+
+    config_path = path / config_filename
+    if not config_path.exists():
+        return None
+
+    with config_path.open() as f:
+        config = json.load(f)
+
+    return {step.get("registry_name") or step["class"].rsplit(".", 1)[1] for step in config.get("steps", [])}
+
+
+def _has_legacy_smolvla_mixed_action_processors(
+    policy_cfg: SmolVLAConfig,
+    pretrained_path: str,
+    *,
+    preprocessor_config_filename: str,
+    postprocessor_config_filename: str,
+) -> bool:
+    if not (policy_cfg.use_discrete_base_heads or policy_cfg.use_hybrid_action_heads):
+        return False
+
+    preprocessor_keys = _get_local_processor_step_keys(pretrained_path, preprocessor_config_filename)
+    if preprocessor_keys is None:
+        return False
+    if "extract_discrete_base_targets" not in preprocessor_keys:
+        return True
+
+    postprocessor_keys = _get_local_processor_step_keys(pretrained_path, postprocessor_config_filename)
+    return (
+        policy_cfg.use_discrete_base_heads
+        and postprocessor_keys is not None
+        and "assemble_lekiwi_passthrough_action" not in postprocessor_keys
+    )
+
+
+def _apply_processor_overrides(pipeline: PolicyProcessorPipeline, overrides: dict[str, Any]) -> None:
+    if not overrides:
+        return
+
+    for index, step in enumerate(pipeline.steps):
+        step_key = getattr(step.__class__, "_registry_name", step.__class__.__name__)
+        if step_key not in overrides:
+            continue
+
+        step_config = step.get_config()
+        step_config.update(overrides[step_key])
+        pipeline.steps[index] = step.__class__(**step_config)
+
+
 def make_pre_post_processors(
     policy_cfg: PreTrainedConfig,
     pretrained_path: str | None = None,
@@ -310,6 +365,29 @@ def make_pre_post_processors(
         preprocessor_overrides = dict(kwargs.get("preprocessor_overrides") or {})
         postprocessor_overrides = dict(kwargs.get("postprocessor_overrides") or {})
         dataset_stats = kwargs.get("dataset_stats")
+        preprocessor_config_filename = kwargs.get(
+            "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+        )
+        postprocessor_config_filename = kwargs.get(
+            "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+        )
+
+        if isinstance(policy_cfg, SmolVLAConfig) and _has_legacy_smolvla_mixed_action_processors(
+            policy_cfg,
+            pretrained_path,
+            preprocessor_config_filename=preprocessor_config_filename,
+            postprocessor_config_filename=postprocessor_config_filename,
+        ):
+            from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
+
+            preprocessor, postprocessor = make_smolvla_pre_post_processors(
+                config=policy_cfg,
+                dataset_stats=dataset_stats,
+            )
+            _apply_processor_overrides(preprocessor, preprocessor_overrides)
+            _apply_processor_overrides(postprocessor, postprocessor_overrides)
+            _reconnect_smolvla_discrete_base_steps(preprocessor, postprocessor)
+            return preprocessor, postprocessor
 
         if dataset_stats is not None and not isinstance(policy_cfg, GrootConfig):
             preprocessor_overrides = _merge_processor_stats_overrides(
@@ -323,19 +401,28 @@ def make_pre_post_processors(
                 dataset_stats=dataset_stats,
             )
 
-        if isinstance(policy_cfg, SmolVLAConfig) and policy_cfg.use_discrete_base_heads:
+        if isinstance(policy_cfg, SmolVLAConfig) and (
+            policy_cfg.use_discrete_base_heads or policy_cfg.use_hybrid_action_heads
+        ):
+            action_heads = (
+                policy_cfg.hybrid_action_heads
+                if policy_cfg.use_hybrid_action_heads
+                else policy_cfg.action_heads
+            )
             extract_overrides = dict(preprocessor_overrides.get("extract_discrete_base_targets", {}))
-            extract_overrides.setdefault("action_heads", policy_cfg.action_heads)
+            extract_overrides.setdefault("action_heads", action_heads)
             preprocessor_overrides["extract_discrete_base_targets"] = extract_overrides
 
-            assemble_overrides = dict(postprocessor_overrides.get("assemble_lekiwi_passthrough_action", {}))
-            assemble_overrides.setdefault("arm_passthrough_dims", policy_cfg.arm_passthrough_dims)
-            assemble_overrides.setdefault("base_action_dims", policy_cfg.base_action_dims)
-            assemble_overrides.setdefault("export_action_dim", policy_cfg.export_action_dim)
-            assemble_overrides.setdefault("action_heads", policy_cfg.action_heads)
-            postprocessor_overrides["assemble_lekiwi_passthrough_action"] = assemble_overrides
+            if policy_cfg.use_discrete_base_heads:
+                assemble_overrides = dict(postprocessor_overrides.get("assemble_lekiwi_passthrough_action", {}))
+                assemble_overrides.setdefault("arm_passthrough_dims", policy_cfg.arm_passthrough_dims)
+                assemble_overrides.setdefault("base_action_dims", policy_cfg.base_action_dims)
+                assemble_overrides.setdefault("export_action_dim", policy_cfg.export_action_dim)
+                assemble_overrides.setdefault("action_heads", policy_cfg.action_heads)
+                postprocessor_overrides["assemble_lekiwi_passthrough_action"] = assemble_overrides
 
-            # Discrete-base SmolVLA assembles raw LeKiwi actions directly instead of unnormalizing tensors.
+            # Discrete-base and hybrid SmolVLA assemble raw LeKiwi actions directly instead of
+            # unnormalizing the final tensor in a generic postprocessor.
             postprocessor_overrides.pop("unnormalizer_processor", None)
 
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
@@ -359,18 +446,14 @@ def make_pre_post_processors(
 
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
-            config_filename=kwargs.get(
-                "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
-            ),
+            config_filename=preprocessor_config_filename,
             overrides=preprocessor_overrides,
             to_transition=batch_to_transition,
             to_output=transition_to_batch,
         )
         postprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
-            config_filename=kwargs.get(
-                "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
-            ),
+            config_filename=postprocessor_config_filename,
             overrides=postprocessor_overrides,
             to_transition=policy_action_to_transition,
             to_output=transition_to_policy_action,

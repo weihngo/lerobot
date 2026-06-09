@@ -65,6 +65,20 @@ class SmolVLAConfig(PreTrainedConfig):
         ]
     )
 
+    # Hybrid LeKiwi mode: continuous arm actions + discrete base velocity heads.
+    # Kept separate from action_heads so old mixed-action checkpoints keep the same parameter shapes.
+    use_hybrid_action_heads: bool = False
+    hybrid_arm_action_dims: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5])
+    hybrid_action_heads: list[SmolVLAActionHeadConfig] = field(
+        default_factory=lambda: [
+            SmolVLAActionHeadConfig("base_x", "categorical", 6, [0.0, 0.1]),
+            SmolVLAActionHeadConfig("base_y", "categorical", 7, [0.0]),
+            SmolVLAActionHeadConfig("base_theta", "categorical", 8, [0.0, 30.0]),
+        ]
+    )
+    hybrid_arm_loss_weight: float = 1.0
+    hybrid_base_loss_weight: float = 1.0
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
@@ -144,60 +158,88 @@ class SmolVLAConfig(PreTrainedConfig):
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
 
+        if self.use_discrete_base_heads and self.use_hybrid_action_heads:
+            raise ValueError("use_discrete_base_heads and use_hybrid_action_heads are mutually exclusive.")
+
         # Mixed-action validation
         if self.use_discrete_base_heads:
-            # export_action_dim for LeKiwi mixed-action mode is fixed to 9
-            if self.export_action_dim != 9:
-                raise ValueError("LeKiwi mixed-action mode requires export_action_dim=9.")
+            self._validate_lekiwi_action_partition(
+                arm_dims=self.arm_passthrough_dims,
+                action_heads=self.action_heads,
+                arm_field_name="arm_passthrough_dims",
+                heads_field_name="action_heads",
+            )
 
-            # arm_passthrough_dims indices must be within [0, export_action_dim)
-            bad_arm_indices = [idx for idx in self.arm_passthrough_dims if idx < 0 or idx >= self.export_action_dim]
-            if bad_arm_indices:
-                raise ValueError(
-                    f"arm_passthrough_dims indices {sorted(bad_arm_indices)} out of range for export_action_dim={self.export_action_dim}"
-                )
+        if self.use_hybrid_action_heads:
+            self._validate_lekiwi_action_partition(
+                arm_dims=self.hybrid_arm_action_dims,
+                action_heads=self.hybrid_action_heads,
+                arm_field_name="hybrid_arm_action_dims",
+                heads_field_name="hybrid_action_heads",
+            )
+            if self.hybrid_arm_loss_weight < 0 or self.hybrid_base_loss_weight < 0:
+                raise ValueError("Hybrid action loss weights must be non-negative.")
+            if self.hybrid_arm_loss_weight + self.hybrid_base_loss_weight <= 0:
+                raise ValueError("Hybrid action loss weights must sum to a positive value.")
 
-            # arm_passthrough_dims must not contain duplicate indices
-            dup_arm = sorted({x for x in self.arm_passthrough_dims if self.arm_passthrough_dims.count(x) > 1})
-            if dup_arm:
-                raise ValueError(f"arm_passthrough_dims contain duplicate indices: {dup_arm}")
+    def _validate_lekiwi_action_partition(
+        self,
+        *,
+        arm_dims: list[int],
+        action_heads: list[SmolVLAActionHeadConfig],
+        arm_field_name: str,
+        heads_field_name: str,
+    ) -> None:
+        # export_action_dim for LeKiwi mixed/hybrid action mode is fixed to 9
+        if self.export_action_dim != 9:
+            raise ValueError("LeKiwi action partition mode requires export_action_dim=9.")
 
-            head_indices = [head.index for head in self.action_heads]
+        bad_arm_indices = [idx for idx in arm_dims if idx < 0 or idx >= self.export_action_dim]
+        if bad_arm_indices:
+            raise ValueError(
+                f"{arm_field_name} indices {sorted(bad_arm_indices)} out of range for "
+                f"export_action_dim={self.export_action_dim}"
+            )
 
-            # action_heads indices must be within [0, export_action_dim)
-            bad_head_indices = [idx for idx in head_indices if idx < 0 or idx >= self.export_action_dim]
-            if bad_head_indices:
-                raise ValueError(
-                    f"action_heads contain indices {sorted(bad_head_indices)} out of range for export_action_dim={self.export_action_dim}"
-                )
+        dup_arm = sorted({x for x in arm_dims if arm_dims.count(x) > 1})
+        if dup_arm:
+            raise ValueError(f"{arm_field_name} contain duplicate indices: {dup_arm}")
 
-            # action_heads indices must be unique
-            dup_heads = sorted({x for x in head_indices if head_indices.count(x) > 1})
-            if dup_heads:
-                raise ValueError(f"action_heads contain duplicate indices: {dup_heads}")
+        head_indices = [head.index for head in action_heads]
+        bad_head_indices = [idx for idx in head_indices if idx < 0 or idx >= self.export_action_dim]
+        if bad_head_indices:
+            raise ValueError(
+                f"{heads_field_name} contain indices {sorted(bad_head_indices)} out of range for "
+                f"export_action_dim={self.export_action_dim}"
+            )
 
-            # arm_passthrough_dims and action_heads must not overlap
-            overlap = set(self.arm_passthrough_dims) & set(head_indices)
-            if overlap:
-                raise ValueError(f"arm_passthrough_dims overlap with action_heads: {sorted(overlap)}")
+        dup_heads = sorted({x for x in head_indices if head_indices.count(x) > 1})
+        if dup_heads:
+            raise ValueError(f"{heads_field_name} contain duplicate indices: {dup_heads}")
 
-            # base_action_dims must not contain duplicate indices
-            dup_base = sorted({x for x in self.base_action_dims if self.base_action_dims.count(x) > 1})
-            if dup_base:
-                raise ValueError(f"base_action_dims contain duplicate indices: {dup_base}")
+        empty_heads = [head.name for head in action_heads if len(head.values) == 0]
+        if empty_heads:
+            raise ValueError(f"{heads_field_name} contain heads without values: {empty_heads}")
 
-            # base_action_dims must match the indices used by action_heads
-            if set(self.base_action_dims) != set(head_indices):
-                raise ValueError(
-                    f"base_action_dims {self.base_action_dims} do not match action_heads indices {sorted(head_indices)}"
-                )
+        overlap = set(arm_dims) & set(head_indices)
+        if overlap:
+            raise ValueError(f"{arm_field_name} overlap with {heads_field_name}: {sorted(overlap)}")
 
-            # The exported action dimension must equal the sum of passthrough and head dims
-            if len(self.arm_passthrough_dims) + len(self.action_heads) != self.export_action_dim:
-                raise ValueError(
-                    f"len(arm_passthrough_dims) + len(action_heads) must equal export_action_dim. Got "
-                    f"{len(self.arm_passthrough_dims)} + {len(self.action_heads)} != {self.export_action_dim}"
-                )
+        dup_base = sorted({x for x in self.base_action_dims if self.base_action_dims.count(x) > 1})
+        if dup_base:
+            raise ValueError(f"base_action_dims contain duplicate indices: {dup_base}")
+
+        if set(self.base_action_dims) != set(head_indices):
+            raise ValueError(
+                f"base_action_dims {self.base_action_dims} do not match {heads_field_name} indices "
+                f"{sorted(head_indices)}"
+            )
+
+        if len(arm_dims) + len(action_heads) != self.export_action_dim:
+            raise ValueError(
+                f"len({arm_field_name}) + len({heads_field_name}) must equal export_action_dim. Got "
+                f"{len(arm_dims)} + {len(action_heads)} != {self.export_action_dim}"
+            )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
